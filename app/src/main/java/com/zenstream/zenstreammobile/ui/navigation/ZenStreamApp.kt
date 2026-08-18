@@ -78,6 +78,7 @@ private const val HOME = "home"
 private const val SEARCH = "search"
 private const val LIBRARY = "library"
 private const val FAVORITES = "favorites"
+private const val DOWNLOADS = "downloads"
 private const val DETAIL = "detail/{itemId}"
 private const val SETTINGS = "settings"
 
@@ -126,14 +127,19 @@ private fun MainScaffold(
                 LucideR.drawable.lucide_ic_house,
             ),
             NavigationDestination(
+                LIBRARY,
+                com.zenstream.zenstreammobile.R.string.library,
+                LucideR.drawable.lucide_ic_library,
+            ),
+            NavigationDestination(
                 SEARCH,
                 com.zenstream.zenstreammobile.R.string.search,
                 LucideR.drawable.lucide_ic_search,
             ),
             NavigationDestination(
-                LIBRARY,
-                com.zenstream.zenstreammobile.R.string.library,
-                LucideR.drawable.lucide_ic_library,
+                DOWNLOADS,
+                com.zenstream.zenstreammobile.R.string.downloads,
+                LucideR.drawable.lucide_ic_download,
             ),
             NavigationDestination(
                 FAVORITES,
