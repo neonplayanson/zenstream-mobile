@@ -19,6 +19,7 @@
     <string name="search">検索</string>
     <string name="library">ライブラリ</string>
     <string name="favorites">お気に入り</string>
+    <string name="downloads">ダウンロード</string>
     <string name="continue_watching">視聴を続ける</string>
     <string name="next_up">次に見る</string>
     <string name="my_list">マイリスト</string>
@@ -230,5 +231,4 @@
     <string name="syncplay_participant_replaced">&#x3053;&#x306E;&#x30A2;&#x30AB;&#x30A6;&#x30F3;&#x30C8;&#x304C;&#x5225;&#x306E;&#x30C7;&#x30D0;&#x30A4;&#x30B9;&#x307E;&#x305F;&#x306F;&#x30BF;&#x30D6;&#x304B;&#x3089;&#x53C2;&#x52A0;&#x3057;&#x305F;&#x305F;&#x3081;&#x3001;Syncplay &#x304B;&#x3089;&#x5207;&#x65AD;&#x3055;&#x308C;&#x307E;&#x3057;&#x305F;&#x3002;</string>
     <string name="cast">キャスト</string>
     <string name="crew">スタッフ</string>
-    <string name="downloads">ダウンロード</string>
 </resources>
