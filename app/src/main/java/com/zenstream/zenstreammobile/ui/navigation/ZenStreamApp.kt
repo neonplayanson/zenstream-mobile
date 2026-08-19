@@ -11,15 +11,18 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.TopAppBar
@@ -43,14 +46,19 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.dialog
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.adamglin.phosphoricons.BoldGroup
+import com.adamglin.phosphoricons.bold.MagnifyingGlass
 import com.composables.icons.lucide.R as LucideR
+import com.zenstream.zenstreammobile.R
 import com.zenstream.zenstreammobile.data.CatalogRepository
 import com.zenstream.zenstreammobile.data.SyncplayManager
 import com.zenstream.zenstreammobile.launchPlayback
@@ -62,15 +70,16 @@ import com.zenstream.zenstreammobile.ui.AppUiState
 import com.zenstream.zenstreammobile.ui.AppViewModel
 import com.zenstream.zenstreammobile.ui.components.SyncplayToastNotifications
 import com.zenstream.zenstreammobile.ui.components.ToastHost
+import com.zenstream.zenstreammobile.ui.components.UserAvatar
 import com.zenstream.zenstreammobile.ui.components.rememberToastHostState
 import com.zenstream.zenstreammobile.ui.screens.DetailScreen
 import com.zenstream.zenstreammobile.ui.screens.FavoritesScreen
 import com.zenstream.zenstreammobile.ui.screens.HomeScreen
 import com.zenstream.zenstreammobile.ui.screens.LibraryScreen
 import com.zenstream.zenstreammobile.ui.screens.LoginScreen
-import com.zenstream.zenstreammobile.ui.screens.SearchScreen
+import com.zenstream.zenstreammobile.ui.screens.MyPageScreen
+import com.zenstream.zenstreammobile.ui.screens.SearchOverlayScreen
 import com.zenstream.zenstreammobile.ui.screens.ServerSetupScreen
-import com.zenstream.zenstreammobile.ui.screens.SettingsScreen
 import com.zenstream.zenstreammobile.ui.screens.SyncplayGroupMenu
 import kotlinx.coroutines.launch
 
@@ -79,11 +88,21 @@ private const val SEARCH = "search"
 private const val LIBRARY = "library"
 private const val FAVORITES = "favorites"
 private const val DOWNLOADS = "downloads"
+private const val MYPAGE = "my-page"
 private const val DETAIL = "detail/{itemId}"
-private const val SETTINGS = "settings"
+
+internal fun shouldShowMainSearchAction(route: String): Boolean =
+    route == HOME || route == FAVORITES || route == LIBRARY
 
 @Composable
-fun ZenStreamApp(appState: AppUiState, repository: CatalogRepository, appViewModel: AppViewModel) {
+fun ZenStreamApp(
+    appState: AppUiState,
+    repository: CatalogRepository,
+    appViewModel: AppViewModel,
+    onPickAvatar: () -> Unit = {},
+    avatarPickerResult: Uri? = null,
+    onAvatarPickerResultConsumed: () -> Unit = {},
+) {
     when {
         appState.loading -> LoadingScreen()
         appState.showSetup ->
@@ -93,7 +112,16 @@ fun ZenStreamApp(appState: AppUiState, repository: CatalogRepository, appViewMod
             )
 
         appState.showLogin -> LoginScreen(repository, appViewModel::changeServer)
-        appState.session != null -> MainScaffold(repository, appState.session, appViewModel::logout)
+        appState.session != null ->
+            MainScaffold(
+                repository = repository,
+                session = appState.session,
+                onLogout = appViewModel::logout,
+                onPasswordChanged = appViewModel::passwordChanged,
+                onPickAvatar = onPickAvatar,
+                avatarPickerResult = avatarPickerResult,
+                onAvatarPickerResultConsumed = onAvatarPickerResultConsumed,
+            )
         else -> LoadingScreen()
     }
 }
@@ -111,14 +139,25 @@ private fun MainScaffold(
     repository: CatalogRepository,
     session: AuthSession,
     onLogout: () -> Unit,
+    onPasswordChanged: () -> Unit,
+    onPickAvatar: () -> Unit,
+    avatarPickerResult: Uri?,
+    onAvatarPickerResultConsumed: () -> Unit,
 ) {
-    val syncplay = remember(session) { repository.syncplayManager(session) }
+    val syncplay = remember(session.token) { repository.syncplayManager(session) }
     val syncplayState by syncplay.state.collectAsStateWithLifecycle()
     val toast = rememberToastHostState()
     val scope = rememberCoroutineScope()
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = backStackEntry?.destination?.route?.substringBefore("/") ?: HOME
+    val currentRoute = routeName(backStackEntry?.destination?.route) ?: HOME
+    val mainRoute =
+        if (currentRoute == SEARCH) {
+            routeName(navController.previousBackStackEntry?.destination?.route) ?: HOME
+        } else {
+            currentRoute
+        }
+    val searchOverlayOpen = currentRoute == SEARCH
     val destinations = remember {
         listOf(
             NavigationDestination(
@@ -211,16 +250,17 @@ private fun MainScaffold(
         }
     }
 
-    LaunchedEffect(currentRoute) {
+    LaunchedEffect(mainRoute) {
         bottomBarVisible = bottomBarVisibility.resetForRoute()
         topBarVisible = topBarVisibility.resetForRoute()
     }
 
-    val chromeHidden = currentRoute == DETAIL.substringBefore("/") || currentRoute == SETTINGS
+    val detailRoute = mainRoute == DETAIL.substringBefore("/")
+    val topBarHidden = detailRoute || mainRoute == MYPAGE
 
     androidx.compose.material3.Scaffold(
         topBar = {
-            if (!chromeHidden) {
+            if (!topBarHidden) {
                 Box(
                     modifier =
                         Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)
@@ -239,13 +279,11 @@ private fun MainScaffold(
                         MainTopBar(
                             syncplay = syncplay,
                             session = session,
+                            showSearchAction =
+                                !searchOverlayOpen && shouldShowMainSearchAction(mainRoute),
+                            onSearch = { navigateToSearch(navController) },
                             onReturnToView = { group ->
                                 group.mediaItemId()?.let { launchPlayback(context, it, "") }
-                            },
-                            onSettings = {
-                                navController.navigate(SETTINGS) {
-                                    launchSingleTop = true
-                                }
                             },
                         )
                     }
@@ -253,7 +291,7 @@ private fun MainScaffold(
             }
         },
         bottomBar = {
-            if (!chromeHidden) {
+            if (!detailRoute) {
                 // Keep the system navigation-control surface mounted while the
                 // menu items animate. This prevents content from showing through
                 // the Android control strip during the transition.
@@ -274,36 +312,13 @@ private fun MainScaffold(
                                 slideOutVertically(targetOffsetY = { it }) +
                                 fadeOut(),
                     ) {
-                        androidx.compose.material3.NavigationBar(
-                            containerColor = Color.Transparent,
-                            windowInsets = WindowInsets(0, 0, 0, 0),
-                        ) {
-                            destinations.forEach { destination ->
-                                NavigationBarItem(
-                                    selected = currentRoute == destination.route,
-                                    onClick = {
-                                        navController.navigate(destination.route) {
-                                            popUpTo(HOME) { saveState = true }
-                                            launchSingleTop = true
-                                            restoreState = true
-                                        }
-                                    },
-                                    icon = {
-                                        Icon(
-                                            painter = painterResource(destination.icon),
-                                            contentDescription = null,
-                                        )
-                                    },
-                                    label = {
-                                        androidx.compose.material3.Text(
-                                            androidx.compose.ui.res.stringResource(
-                                                destination.label
-                                            )
-                                        )
-                                    },
-                                )
-                            }
-                        }
+                        MainNavigationBar(
+                            currentRoute = mainRoute,
+                            session = session,
+                            onDestinationClick = { route ->
+                                navigateToMainDestination(navController, route)
+                            },
+                        )
                     }
                 }
             }
@@ -324,14 +339,24 @@ private fun MainScaffold(
                         onItemClick = { item -> navigateToDetail(navController, item.id) },
                     )
                 }
-                composable(SEARCH) {
-                    SearchScreen(
-                        repository,
-                        session,
-                        padding,
-                    ) { item ->
-                        navigateToDetail(navController, item.id)
-                    }
+                dialog(
+                    SEARCH,
+                    dialogProperties =
+                        DialogProperties(
+                            usePlatformDefaultWidth = false,
+                            decorFitsSystemWindows = false,
+                            dismissOnBackPress = true,
+                            dismissOnClickOutside = false,
+                        ),
+                ) {
+                    SearchOverlayScreen(
+                        repository = repository,
+                        session = session,
+                        onDismiss = { navController.popBackStack() },
+                        onItemClick = { item ->
+                            navigateToDetail(navController, item.id)
+                        },
+                    )
                 }
                 composable(LIBRARY) {
                     LibraryScreen(
@@ -350,6 +375,18 @@ private fun MainScaffold(
                     ) { item ->
                         navigateToDetail(navController, item.id)
                     }
+                }
+                composable(MYPAGE) {
+                    MyPageScreen(
+                        repository = repository,
+                        session = session,
+                        onLogout = onLogout,
+                        onPasswordChanged = onPasswordChanged,
+                        outerPadding = padding,
+                        onPickAvatar = onPickAvatar,
+                        avatarPickerResult = avatarPickerResult,
+                        onAvatarPickerResultConsumed = onAvatarPickerResultConsumed,
+                    )
                 }
                 composable(
                     DETAIL,
@@ -385,13 +422,6 @@ private fun MainScaffold(
                         },
                     )
                 }
-                composable(SETTINGS) {
-                    SettingsScreen(
-                        repository = repository,
-                        onBack = { navController.popBackStack() },
-                        onLogout = onLogout,
-                    )
-                }
             }
             SyncplayToastNotifications(
                 manager = syncplay,
@@ -410,6 +440,33 @@ private fun navigateToDetail(navController: androidx.navigation.NavHostControlle
     }
 }
 
+internal fun navigateToMainDestination(
+    navController: androidx.navigation.NavHostController,
+    route: String,
+) {
+    // Search is a transient route pushed above the main destinations. Remove it before restoring
+    // the selected tab so a saved Search entry cannot remain visible over the requested page.
+    if (routeName(navController.currentDestination?.route) == SEARCH) {
+        navController.popBackStack()
+    }
+    if (navController.currentDestination?.route == route) return
+
+    navController.navigate(route) {
+        popUpTo(HOME) { saveState = true }
+        launchSingleTop = true
+        restoreState = true
+    }
+}
+
+private fun navigateToSearch(navController: androidx.navigation.NavHostController) {
+    navController.navigate(SEARCH) {
+        launchSingleTop = true
+        restoreState = true
+    }
+}
+
+private fun routeName(route: String?): String? = route?.substringBefore("/")?.substringBefore("?")
+
 private fun navigateToPlayback(
     context: Context,
     itemId: String,
@@ -425,7 +482,8 @@ internal fun MainTopBar(
     syncplay: SyncplayManager? = null,
     session: AuthSession? = null,
     onReturnToView: (SyncplayGroup) -> Unit = {},
-    onSettings: () -> Unit = {},
+    showSearchAction: Boolean = false,
+    onSearch: () -> Unit = {},
 ) {
     TopAppBar(
         title = {
@@ -437,27 +495,20 @@ internal fun MainTopBar(
             )
         },
         actions = {
+            if (showSearchAction) {
+                IconButton(onClick = onSearch) {
+                    Icon(
+                        imageVector = BoldGroup.MagnifyingGlass,
+                        contentDescription = stringResource(R.string.search),
+                    )
+                }
+            }
             if (syncplay != null && session != null) {
                 SyncplayGroupMenu(
                     manager = syncplay,
                     session = session,
                     onReturnToView = onReturnToView,
                 )
-            }
-            Box(
-                modifier = Modifier.size(48.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                androidx.compose.material3.IconButton(onClick = onSettings) {
-                    Icon(
-                        painter = painterResource(LucideR.drawable.lucide_ic_settings),
-                        contentDescription =
-                            stringResource(
-                                com.zenstream.zenstreammobile.R.string.settings_description
-                            ),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
         },
         colors =
@@ -467,11 +518,95 @@ internal fun MainTopBar(
     )
 }
 
-private data class NavigationDestination(
+internal data class NavigationDestination(
     val route: String,
     val label: Int,
-    @androidx.annotation.DrawableRes val icon: Int,
+    @androidx.annotation.DrawableRes val icon: Int? = null,
 )
+
+internal fun mainNavigationDestinations(): List<NavigationDestination> =
+    listOf(
+        NavigationDestination(
+            HOME,
+            com.zenstream.zenstreammobile.R.string.home,
+            LucideR.drawable.lucide_ic_house,
+        ),
+        NavigationDestination(
+            FAVORITES,
+            com.zenstream.zenstreammobile.R.string.favorites,
+            LucideR.drawable.lucide_ic_heart,
+        ),
+        NavigationDestination(
+            LIBRARY,
+            com.zenstream.zenstreammobile.R.string.library,
+            LucideR.drawable.lucide_ic_library_big,
+        ),
+        NavigationDestination(
+            MYPAGE,
+            com.zenstream.zenstreammobile.R.string.my_page,
+        ),
+    )
+
+@Composable
+internal fun MainNavigationBar(
+    currentRoute: String,
+    session: AuthSession,
+    onDestinationClick: (String) -> Unit,
+) {
+    androidx.compose.material3.NavigationBar(
+        containerColor = MaterialTheme.colorScheme.background,
+        tonalElevation = 3.dp,
+        windowInsets = WindowInsets(0, 0, 0, 0),
+    ) {
+        mainNavigationDestinations().forEach { destination ->
+            NavigationBarItem(
+                selected = currentRoute == destination.route,
+                onClick = { onDestinationClick(destination.route) },
+                colors =
+                    androidx.compose.material3.NavigationBarItemDefaults.colors(
+                        selectedIconColor = MaterialTheme.colorScheme.primary,
+                        selectedTextColor = MaterialTheme.colorScheme.primary,
+                        indicatorColor = Color.Transparent,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                icon = {
+                    if (destination.route == MYPAGE) {
+                        Box(Modifier.size(24.dp)) {
+                            UserAvatar(
+                                session = session,
+                                userId = session.userId,
+                                username = session.username,
+                                modifier = Modifier.size(24.dp),
+                                contentDescription = stringResource(R.string.my_page),
+                            )
+                            if (currentRoute == destination.route) {
+                                Box(
+                                    Modifier.fillMaxSize()
+                                        .border(
+                                            width = 1.5.dp,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            shape = CircleShape,
+                                        )
+                                )
+                            }
+                        }
+                    } else {
+                        destination.icon?.let { icon ->
+                            Icon(
+                                painter = painterResource(icon),
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                },
+                label = {
+                    androidx.compose.material3.Text(stringResource(destination.label))
+                },
+            )
+        }
+    }
+}
 
 internal class ScrollVisibilityController(
     private val hideDistance: Float,

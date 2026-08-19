@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.drop
@@ -60,6 +61,8 @@ data class AppUiState(
 }
 
 class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
+    private var accountRefreshToken: String? = null
+
     val uiState: StateFlow<AppUiState> =
         combine(
                 repository.orchestratorUrl,
@@ -79,10 +82,19 @@ class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
 
     init {
         viewModelScope.launch {
-            repository.session.collectLatest { session ->
-                if (session != null) {
-                    runCatching { repository.syncInterfaceLocale(session) }
+            repository.session.collect { session ->
+                if (session == null) {
+                    accountRefreshToken = null
+                    return@collect
                 }
+                if (accountRefreshToken != session.token) {
+                    // Account data is refreshed once per bearer token so avatar
+                    // changes made on another client appear without creating a
+                    // startup request loop when the session is persisted again.
+                    accountRefreshToken = session.token
+                    runCatching { repository.refreshCurrentAccount() }
+                }
+                runCatching { repository.syncInterfaceLocale(session) }
             }
         }
     }
@@ -92,6 +104,11 @@ class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
     fun logout() = viewModelScope.launch {
         val active = repository.session.first()
         if (active != null) runCatching { repository.revokeSession(active) }
+        SyncplaySession.clear()
+        repository.clearSession()
+    }
+
+    fun passwordChanged() = viewModelScope.launch {
         SyncplaySession.clear()
         repository.clearSession()
     }
@@ -262,7 +279,9 @@ class HomeViewModel(private val repository: HomeDataSource, private val session:
     }
 
     private suspend fun handleFailure(error: Throwable) {
-        if ((error as? CatalogException)?.statusCode == 401) repository.clearSession()
+        if ((error as? CatalogException)?.statusCode == 401) {
+            repository.clearSessionIfCurrent(session)
+        }
     }
 
     private fun addPendingSections(count: Int) {
@@ -393,7 +412,9 @@ class LibraryViewModel(
                     }
                 }
                 .onFailure {
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.value = _uiState.value.copy(loading = false, error = true)
                 }
         }
@@ -479,7 +500,9 @@ class LibraryViewModel(
                 }
                 .onFailure {
                     if (generation != requestGeneration) return@onFailure
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.update { current ->
                         current.copy(loadingMore = false, loadMoreError = true)
                     }
@@ -515,7 +538,9 @@ class LibraryViewModel(
             }
             .onFailure {
                 if (generation != requestGeneration) return@onFailure
-                if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                if ((it as? CatalogException)?.statusCode == 401) {
+                    repository.clearSessionIfCurrent(session)
+                }
                 _uiState.update { current -> current.copy(loading = false, error = true) }
             }
     }
@@ -606,7 +631,9 @@ class SearchViewModel(
             }
             .onFailure {
                 if (generation != requestGeneration) return@onFailure
-                if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                if ((it as? CatalogException)?.statusCode == 401) {
+                    repository.clearSessionIfCurrent(session)
+                }
                 _uiState.value = _uiState.value.copy(loading = false, error = true)
             }
     }
@@ -717,7 +744,9 @@ class FavoritesViewModel(
             }
         } catch (error: Throwable) {
             if (error is CancellationException || generation != requestGeneration) throw error
-            if ((error as? CatalogException)?.statusCode == 401) repository.clearSession()
+            if ((error as? CatalogException)?.statusCode == 401) {
+                repository.clearSessionIfCurrent(session)
+            }
             _uiState.update {
                 it.copy(
                     loading = false,
@@ -839,7 +868,9 @@ class DetailViewModel(
                 }
                 .onFailure {
                     if (generation != loadGeneration) return@onFailure
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.value =
                         _uiState.value.copy(
                             loading = false,
@@ -876,7 +907,9 @@ class DetailViewModel(
                 }
                 .onFailure {
                     if (generation != loadGeneration) return@onFailure
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.value =
                         DetailUiState(
                             loading = false,
@@ -986,7 +1019,9 @@ class DetailViewModel(
                 )
             runCatching { action(previous, targetValue) }
                 .onFailure {
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.value =
                         _uiState.value.copy(
                             data = current,
@@ -1029,7 +1064,9 @@ class DetailViewModel(
                 )
             runCatching { action(previous, targetValue) }
                 .onFailure {
-                    if ((it as? CatalogException)?.statusCode == 401) repository.clearSession()
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
                     _uiState.value =
                         _uiState.value.copy(
                             data = current,

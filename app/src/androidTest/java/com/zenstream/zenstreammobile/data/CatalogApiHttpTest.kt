@@ -4,6 +4,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.zenstream.zenstreammobile.model.AuthSession
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.json.JSONObject
@@ -58,6 +60,42 @@ class CatalogApiHttpTest {
     }
 
     @Test
+    fun loginParsesTheNullableAvatarVersion() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    JSONObject()
+                        .put("token", "login-token")
+                        .put(
+                            "user",
+                            JSONObject()
+                                .put("id", "user-1")
+                                .put("username", "Test")
+                                .put("avatarVersion", "v-login"),
+                        )
+                        .toString()
+                )
+        )
+        server.enqueue(
+            MockResponse().setBody(JSONObject().put("ticket", "resource-ticket").toString())
+        )
+
+        val session =
+            CatalogApi(deviceId = "device-id")
+                .authenticate(
+                    serverUrl = server.url("/").toString(),
+                    username = "Test",
+                    password = "password",
+                )
+
+        assertEquals("v-login", session.avatarVersion)
+        val loginRequest = server.takeRequest()
+        assertEquals("POST", loginRequest.method)
+        assertEquals("/api/auth/login", loginRequest.path)
+        assertEquals("GET", server.takeRequest().method)
+    }
+
+    @Test
     fun writesWatchedAndFavoriteStateWithCatalogStatePatches() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(204))
         server.enqueue(MockResponse().setResponseCode(204))
@@ -93,6 +131,103 @@ class CatalogApiHttpTest {
         assertEquals("DELETE", request.method)
         assertEquals("/api/playback/sessions/session-1", request.path)
         assertEquals("Bearer test-token", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun uploadsRawAvatarBytesWithPixelCropParameters() = runBlocking {
+        server.enqueue(MockResponse().setBody(JSONObject().put("avatarVersion", "v-2").toString()))
+        val session =
+            AuthSession(server.url("/").toString().trimEnd('/'), "test-token", "user-1", "Test")
+        val bytes = byteArrayOf(1, 2, 3, 4)
+
+        val version =
+            CatalogApi(deviceId = "device-id")
+                .uploadAvatar(
+                    session,
+                    bytes.toRequestBody("image/png".toMediaType()),
+                    "image/png",
+                    AvatarCrop(cropX = 12, cropY = 18, cropSize = 240, rotation = 90),
+                )
+
+        val request = server.takeRequest()
+        assertEquals("v-2", version)
+        assertEquals(
+            "/api/account/avatar?cropX=12&cropY=18&cropSize=240&rotation=90",
+            request.path,
+        )
+        assertEquals("POST", request.method)
+        assertEquals("Bearer test-token", request.getHeader("Authorization"))
+        assertEquals("image/png", request.getHeader("Content-Type"))
+        assertEquals(bytes.toList(), request.body.readByteArray().toList())
+    }
+
+    @Test
+    fun refreshesTheCurrentAccountAvatarVersion() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setBody(
+                    JSONObject()
+                        .put(
+                            "user",
+                            JSONObject()
+                                .put("id", "user-1")
+                                .put("username", "Updated")
+                                .put("avatarVersion", "v-3"),
+                        )
+                        .toString()
+                )
+        )
+        val session =
+            AuthSession(server.url("/").toString().trimEnd('/'), "test-token", "user-1", "Test")
+
+        val refreshed = CatalogApi(deviceId = "device-id").refreshAccount(session)
+
+        assertEquals("Updated", refreshed.username)
+        assertEquals("v-3", refreshed.avatarVersion)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/api/auth/me", request.path)
+        assertEquals("Bearer test-token", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun removesTheCurrentAvatarWithTheAccountEndpoint() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(JSONObject().put("avatarVersion", JSONObject.NULL).toString())
+        )
+        val session =
+            AuthSession(server.url("/").toString().trimEnd('/'), "test-token", "user-1", "Test")
+
+        CatalogApi(deviceId = "device-id").deleteAvatar(session)
+
+        val request = server.takeRequest()
+        assertEquals("DELETE", request.method)
+        assertEquals("/api/account/avatar", request.path)
+        assertEquals("Bearer test-token", request.getHeader("Authorization"))
+    }
+
+    @Test
+    fun changesPasswordWithAuthenticatedJsonAndAcceptsNoContent() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(204))
+        val session =
+            AuthSession(server.url("/").toString().trimEnd('/'), "test-token", "user-1", "Test")
+
+        CatalogApi(deviceId = "device-id")
+            .changePassword(
+                session,
+                "current-password",
+                "new-password",
+                "new-password",
+            )
+
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/api/account/password", request.path)
+        assertEquals("Bearer test-token", request.getHeader("Authorization"))
+        val payload = JSONObject(request.body.readUtf8())
+        assertEquals("current-password", payload.getString("currentPassword"))
+        assertEquals("new-password", payload.getString("newPassword"))
+        assertEquals("new-password", payload.getString("confirmNewPassword"))
     }
 
     @Test

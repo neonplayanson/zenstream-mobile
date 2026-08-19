@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -13,6 +12,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.hideFromAccessibility
 import androidx.compose.ui.text.TextStyle
@@ -23,6 +24,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.zenstream.zenstreammobile.model.SubtitleCue
 import com.zenstream.zenstreammobile.model.SubtitleStyle
+
+internal fun subtitleBottomPadding(style: SubtitleStyle) = style.bottomSpacing.dp
 
 @Composable
 internal fun SubtitleOverlay(
@@ -70,33 +73,30 @@ internal fun StyledSubtitleLine(text: String, style: SubtitleStyle) {
                 .padding(horizontal = 8.dp, vertical = 3.dp),
         contentAlignment = Alignment.Center,
     ) {
-        subtitleOutlineOffsets(style.borderSize).forEach { (x, y) ->
+        val outlineWidthDp = subtitleOutlineStrokeWidthDp(style.borderSize)
+        if (outlineWidthDp > 0f) {
             Text(
                 text = text,
                 color = outline,
-                style = textStyle,
-                modifier =
-                    Modifier.offset(x.dp, y.dp).clearAndSetSemantics { hideFromAccessibility() },
+                style =
+                    textStyle.copy(
+                        drawStyle =
+                            Stroke(
+                                width =
+                                    with(LocalDensity.current) {
+                                        outlineWidthDp.dp.toPx()
+                                    }
+                            )
+                    ),
+                modifier = Modifier.clearAndSetSemantics { hideFromAccessibility() },
             )
         }
         Text(text = text, color = foreground, style = textStyle)
     }
 }
 
-internal fun subtitleOutlineOffsets(borderSize: Float): List<Pair<Int, Int>> {
-    val radius = borderSize.toInt().coerceIn(0, 8)
-    if (radius == 0) return emptyList()
-    return listOf(
-        -radius to 0,
-        radius to 0,
-        0 to -radius,
-        0 to radius,
-        -radius to -radius,
-        radius to -radius,
-        -radius to radius,
-        radius to radius,
-    )
-}
+internal fun subtitleOutlineStrokeWidthDp(borderSize: Float): Float =
+    borderSize.coerceIn(0f, 8f) * 2f
 
 private fun parseSubtitleColor(value: String, fallback: Color): Color =
     runCatching { Color(android.graphics.Color.parseColor(value)) }.getOrDefault(fallback)

@@ -7,7 +7,8 @@ import com.zenstream.zenstreammobile.model.TrickplayManifest
 import com.zenstream.zenstreammobile.model.TrickplaySheet
 import com.zenstream.zenstreammobile.ui.player.InitialSeekController
 import com.zenstream.zenstreammobile.ui.player.MpvEndFileGate
-import com.zenstream.zenstreammobile.ui.player.subtitleOutlineOffsets
+import com.zenstream.zenstreammobile.ui.player.subtitleBottomPadding
+import com.zenstream.zenstreammobile.ui.player.subtitleOutlineStrokeWidthDp
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -376,14 +377,41 @@ class PlaybackParsingTest {
                 com.zenstream.zenstreammobile.model.SubtitleStyle(
                     fontFamily = "unknown",
                     textScale = 400f,
+                    bottomSpacing = 400f,
                     borderSize = -1f,
                     backgroundOpacity = 150f,
                 )
             )
         assertEquals("sans", style.fontFamily)
         assertEquals(200f, style.textScale)
+        assertEquals(300f, style.bottomSpacing)
         assertEquals(0f, style.borderSize)
         assertEquals(100f, style.backgroundOpacity)
+    }
+
+    @Test
+    fun subtitleBottomPaddingUsesTheConfiguredValueWithoutControlClearance() {
+        assertEquals(
+            0f,
+            subtitleBottomPadding(
+                    com.zenstream.zenstreammobile.model.SubtitleStyle(bottomSpacing = 0f)
+                )
+                .value,
+        )
+        assertEquals(
+            217f,
+            subtitleBottomPadding(
+                    com.zenstream.zenstreammobile.model.SubtitleStyle(bottomSpacing = 217f)
+                )
+                .value,
+        )
+        assertEquals(
+            300f,
+            subtitleBottomPadding(
+                    com.zenstream.zenstreammobile.model.SubtitleStyle(bottomSpacing = 300f)
+                )
+                .value,
+        )
     }
 
     @Test
@@ -441,11 +469,12 @@ class PlaybackParsingTest {
     }
 
     @Test
-    fun subtitleOutlineOffsetsFollowTheConfiguredBorderSize() {
-        assertTrue(subtitleOutlineOffsets(0f).isEmpty())
-        assertEquals(8, subtitleOutlineOffsets(4f).size)
-        assertTrue(subtitleOutlineOffsets(4f).contains(-4 to 4))
-        assertTrue(subtitleOutlineOffsets(20f).all { (x, y) -> x in -8..8 && y in -8..8 })
+    fun subtitleOutlineStrokeWidthPreservesTheConfiguredOutwardRadius() {
+        assertEquals(0f, subtitleOutlineStrokeWidthDp(-1f), 0f)
+        assertEquals(0f, subtitleOutlineStrokeWidthDp(0f), 0f)
+        assertEquals(3f, subtitleOutlineStrokeWidthDp(1.5f), 0f)
+        assertEquals(4f, subtitleOutlineStrokeWidthDp(2f), 0f)
+        assertEquals(16f, subtitleOutlineStrokeWidthDp(20f), 0f)
     }
 
     @Test
