@@ -1,7 +1,8 @@
 [versions]
 agp = "9.3.1"
 kotlin = "2.4.10"
-spotless = "8.9.0"
+spotless = "8.10.0"
+kover = "0.9.8"
 ktfmt = "0.63"
 coreKtx = "1.19.0"
 junit = "4.13.2"
@@ -11,14 +12,13 @@ activityCompose = "1.13.0"
 lifecycle = "2.11.0"
 navigation = "2.9.8"
 datastore = "1.2.1"
-okhttp = "5.4.0"
+okhttp = "5.5.0"
 coil = "3.5.0"
 blurhash = "0.3.0"
 composeBom = "2026.08.00"
 media3 = "1.11.0"
 coroutines = "1.11.0"
 lucideIcons = "2.2.1"
-phosphorIcons = "1.0.0"
 json = "20260814"
 
 [libraries]
@@ -39,7 +39,6 @@ androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-
 androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 lucide-icons-android = { group = "com.composables", name = "icons-lucide-android", version.ref = "lucideIcons" }
-phosphor-icon-android = { group = "com.adamglin", name = "phosphor-icon-android", version.ref = "phosphorIcons" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 okhttp-mockwebserver = { group = "com.squareup.okhttp3", name = "mockwebserver", version.ref = "okhttp" }
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
@@ -56,3 +55,4 @@ json = { group = "org.json", name = "json", version.ref = "json" }
 android-application = { id = "com.android.application", version.ref = "agp" }
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 spotless = { id = "com.diffplug.spotless", version.ref = "spotless" }
+kover = { id = "org.jetbrains.kotlinx.kover", version.ref = "kover" }

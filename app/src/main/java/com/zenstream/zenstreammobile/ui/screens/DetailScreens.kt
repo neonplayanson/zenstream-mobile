@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -148,6 +150,7 @@ fun DetailScreen(
                     onSelectSeason = vm::selectSeason,
                     onTogglePlayed = vm::togglePlayed,
                     onToggleFavorite = vm::toggleFavorite,
+                    onToggleFollowing = vm::toggleFollowing,
                     onToggleSeasonPlayed = vm::toggleSeasonPlayed,
                     onToggleSeasonFavorite = vm::toggleSeasonFavorite,
                     trackSource = state.trackSource,
@@ -174,6 +177,7 @@ internal fun DetailContent(
     onSelectSeason: (String) -> Unit,
     onTogglePlayed: () -> Unit,
     onToggleFavorite: () -> Unit,
+    onToggleFollowing: () -> Unit = {},
     onToggleSeasonPlayed: (String) -> Unit = {},
     onToggleSeasonFavorite: (String) -> Unit = {},
     trackSource: MediaSource? = null,
@@ -182,13 +186,18 @@ internal fun DetailContent(
     onSelectSubtitleTrack: (Int?) -> Unit = {},
 ) {
     val mediaItem = data.item
+    val listState = rememberLazyListState()
+    LaunchedEffect(mediaItem.id) {
+        listState.scrollToItem(0)
+    }
     PullToRefreshLayout(
         isRefreshing = isRefreshing,
         onRefresh = onRefresh,
         modifier = Modifier.padding(padding),
     ) {
         LazyColumn(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().testTag("detail_content_list"),
+            state = listState,
             contentPadding = PaddingValues(bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
@@ -202,6 +211,7 @@ internal fun DetailContent(
                     onPlay = { onPlay(playTarget(data)) },
                     onTogglePlayed = onTogglePlayed,
                     onToggleFavorite = onToggleFavorite,
+                    onToggleFollowing = onToggleFollowing,
                 )
                 if (
                     mediaItem.type in setOf("Movie", "Episode") &&
@@ -259,7 +269,12 @@ internal fun DetailContent(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         items(data.similar.distinctBy { it.id }, key = { it.id }) { similar ->
-                            MediaCard(similar, session, wide = false, onClick = onOpenItem)
+                            MediaCard(
+                                similar,
+                                session,
+                                wide = false,
+                                onClick = onOpenItem,
+                            )
                         }
                     }
                 }
@@ -604,6 +619,7 @@ private fun DetailActions(
     onPlay: () -> Unit,
     onTogglePlayed: () -> Unit,
     onToggleFavorite: () -> Unit,
+    onToggleFollowing: () -> Unit,
 ) {
     val watchedLabel =
         stringResource(if (item.played) R.string.mark_unwatched else R.string.mark_watched)
@@ -653,6 +669,26 @@ private fun DetailActions(
                     if (item.favorite) MaterialTheme.colorScheme.primary
                     else MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        if (item.type == "Movie" || item.type == "Series") {
+            val followingLabel =
+                stringResource(if (item.following == true) R.string.unfollow else R.string.follow)
+            IconButton(
+                onClick = onToggleFollowing,
+                enabled = !busy,
+                modifier =
+                    Modifier.semantics {
+                        contentDescription = followingLabel
+                    },
+            ) {
+                Icon(
+                    painter = painterResource(LucideR.drawable.lucide_ic_bookmark),
+                    contentDescription = null,
+                    tint =
+                        if (item.following == true) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

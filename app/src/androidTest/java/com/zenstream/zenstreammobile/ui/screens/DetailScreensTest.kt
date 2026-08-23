@@ -1,6 +1,7 @@
 package com.zenstream.zenstreammobile.ui.screens
 
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
@@ -206,6 +207,71 @@ class DetailScreensTest {
         }
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         composeRule.onNodeWithText(context.getString(R.string.show_more)).assertIsDisplayed()
+    }
+
+    @Test
+    fun switchingEpisodeScrollsDetailBackToTop() {
+        val series = MediaItem("series", "Example Series", type = "Series")
+        val season = MediaItem("season", "Season 1", indexNumber = 1)
+        val episodeOne =
+            MediaItem(
+                "episode-1",
+                "Episode One",
+                type = "Episode",
+                seriesId = series.id,
+                parentIndexNumber = 1,
+                indexNumber = 1,
+            )
+        val episodeTwo =
+            episodeOne.copy(
+                id = "episode-2",
+                name = "Episode Two",
+                indexNumber = 2,
+            )
+        val episodes =
+            (1..30).map { number ->
+                MediaItem(
+                    "list-episode-$number",
+                    "List episode $number",
+                    type = "Episode",
+                    seriesId = series.id,
+                    parentIndexNumber = 1,
+                    indexNumber = number,
+                )
+            }
+        val data =
+            mutableStateOf(
+                DetailData(
+                    item = episodeOne,
+                    parentSeries = series,
+                    seasons = listOf(season),
+                    episodes = episodes,
+                    selectedSeasonId = season.id,
+                )
+            )
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = data.value,
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("detail_content_list").performTouchInput { swipeUp() }
+        composeRule.runOnIdle { data.value = data.value.copy(item = episodeTwo) }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithText("Episode Two").assertIsDisplayed()
     }
 
     @Test

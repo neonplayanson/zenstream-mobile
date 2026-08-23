@@ -3,14 +3,17 @@ package com.zenstream.zenstreammobile.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.zenstream.zenstreammobile.data.AppUpdate
 import com.zenstream.zenstreammobile.data.CatalogException
 import com.zenstream.zenstreammobile.data.CatalogRepository
 import com.zenstream.zenstreammobile.data.FavoritesDataSource
+import com.zenstream.zenstreammobile.data.GitHubUpdateChecker
 import com.zenstream.zenstreammobile.data.HomeDataSource
 import com.zenstream.zenstreammobile.data.LibraryDataSource
 import com.zenstream.zenstreammobile.data.PlaybackPreference
 import com.zenstream.zenstreammobile.data.SearchDataSource
 import com.zenstream.zenstreammobile.data.SyncplaySession
+import com.zenstream.zenstreammobile.data.UpdateSource
 import com.zenstream.zenstreammobile.model.AuthSession
 import com.zenstream.zenstreammobile.model.DetailData
 import com.zenstream.zenstreammobile.model.FavoriteSort
@@ -21,13 +24,13 @@ import com.zenstream.zenstreammobile.model.LibrarySortBy
 import com.zenstream.zenstreammobile.model.MediaItem
 import com.zenstream.zenstreammobile.model.MediaRow
 import com.zenstream.zenstreammobile.model.MediaSource
+import com.zenstream.zenstreammobile.model.NotificationItem
 import com.zenstream.zenstreammobile.model.PlaybackTrackSelection
 import com.zenstream.zenstreammobile.model.RowTitle
 import com.zenstream.zenstreammobile.model.orderedHomeRows
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -49,6 +52,7 @@ data class AppUiState(
     val serverUrl: String? = null,
     val session: AuthSession? = null,
     val locale: String = com.zenstream.zenstreammobile.data.ENGLISH_LOCALE,
+    val availableUpdate: AppUpdate? = null,
 ) {
     val showSetup
         get() = !loading && (orchestratorUrl.isNullOrBlank() || serverUrl.isNullOrBlank())
@@ -60,8 +64,12 @@ data class AppUiState(
         get() = !loading && !showSetup && session != null
 }
 
-class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
+class AppViewModel(
+    private val repository: CatalogRepository,
+    private val updateSource: UpdateSource = GitHubUpdateChecker(),
+) : ViewModel() {
     private var accountRefreshToken: String? = null
+    private val _availableUpdate = MutableStateFlow<AppUpdate?>(null)
 
     val uiState: StateFlow<AppUiState> =
         combine(
@@ -69,13 +77,15 @@ class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
                 repository.serverUrl,
                 repository.session,
                 repository.locale,
-            ) { orchestrator, server, session, locale ->
+                _availableUpdate,
+            ) { orchestrator, server, session, locale, availableUpdate ->
                 AppUiState(
                     loading = false,
                     orchestratorUrl = orchestrator,
                     serverUrl = server,
                     session = session,
                     locale = locale,
+                    availableUpdate = availableUpdate,
                 )
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AppUiState())
@@ -95,8 +105,21 @@ class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
                     runCatching { repository.refreshCurrentAccount() }
                 }
                 runCatching { repository.syncInterfaceLocale(session) }
+                runCatching { repository.loadWatchHistoryPreference() }
             }
         }
+        viewModelScope.launch {
+            if (!repository.checkForUpdatesOnStartup.first()) return@launch
+            try {
+                _availableUpdate.value = updateSource.checkForUpdate()
+            } catch (error: CancellationException) {
+                throw error
+            }
+        }
+    }
+
+    fun dismissAvailableUpdate() {
+        _availableUpdate.value = null
     }
 
     suspend fun configureServer(value: String) = repository.configureOrchestrator(value)
@@ -123,6 +146,146 @@ class AppViewModel(private val repository: CatalogRepository) : ViewModel() {
     class Factory(private val repository: CatalogRepository) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T = AppViewModel(repository) as T
+    }
+}
+
+data class NotificationsUiState(
+    val loading: Boolean = true,
+    val items: List<NotificationItem> = emptyList(),
+    val unreadCount: Int = 0,
+    val nextCursor: String? = null,
+    val error: Boolean = false,
+    val loadingMore: Boolean = false,
+)
+
+class NotificationsViewModel(
+    private val repository: CatalogRepository,
+    private val session: AuthSession,
+) : ViewModel() {
+    private val _uiState = MutableStateFlow(NotificationsUiState())
+    val uiState = _uiState.asStateFlow()
+    private var loadJob: Job? = null
+
+    init {
+        refresh()
+    }
+
+    fun refresh() {
+        loadJob?.cancel()
+        _uiState.value = _uiState.value.copy(loading = true, error = false)
+        loadJob = viewModelScope.launch {
+            runCatching { repository.notifications(session) }
+                .onSuccess { page ->
+                    _uiState.value =
+                        NotificationsUiState(
+                            loading = false,
+                            items = page.items,
+                            unreadCount = page.unreadCount,
+                            nextCursor = page.nextCursor,
+                        )
+                }
+                .onFailure {
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                    _uiState.value = _uiState.value.copy(loading = false, error = true)
+                }
+        }
+    }
+
+    fun loadMore() {
+        val cursor = _uiState.value.nextCursor ?: return
+        if (_uiState.value.loading || _uiState.value.loadingMore) return
+        _uiState.value = _uiState.value.copy(loadingMore = true)
+        loadJob = viewModelScope.launch {
+            runCatching { repository.notifications(session, cursor = cursor) }
+                .onSuccess { page ->
+                    _uiState.update { state ->
+                        state.copy(
+                            loadingMore = false,
+                            items = (state.items + page.items).distinctBy { it.id },
+                            unreadCount = page.unreadCount,
+                            nextCursor = page.nextCursor,
+                        )
+                    }
+                }
+                .onFailure {
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                    _uiState.update { state -> state.copy(loadingMore = false, error = true) }
+                }
+        }
+    }
+
+    fun setRead(item: NotificationItem, read: Boolean) {
+        val current = _uiState.value
+        if ((item.readAt != null) == read) return
+        val marker = if (read) "local" else null
+        _uiState.value =
+            current.copy(
+                items =
+                    current.items.map { if (it.id == item.id) it.copy(readAt = marker) else it },
+                unreadCount = (current.unreadCount + if (read) -1 else 1).coerceAtLeast(0),
+            )
+        viewModelScope.launch {
+            runCatching { repository.setNotificationRead(session, item.id, read) }
+                .onFailure {
+                    _uiState.value = current
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                }
+        }
+    }
+
+    fun markAllRead() {
+        val current = _uiState.value
+        if (current.unreadCount == 0) return
+        _uiState.value =
+            current.copy(
+                items =
+                    current.items.map { if (it.readAt == null) it.copy(readAt = "local") else it },
+                unreadCount = 0,
+            )
+        viewModelScope.launch {
+            runCatching { repository.markAllNotificationsRead(session) }
+                .onFailure {
+                    _uiState.value = current
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                }
+        }
+    }
+
+    fun remove(item: NotificationItem) {
+        val current = _uiState.value
+        if (current.items.none { it.id == item.id }) return
+        _uiState.value =
+            current.copy(
+                items = current.items.filterNot { it.id == item.id },
+                unreadCount =
+                    (current.unreadCount - if (item.readAt == null) 1 else 0).coerceAtLeast(0),
+            )
+        viewModelScope.launch {
+            runCatching { repository.deleteNotification(session, item.id) }
+                .onFailure {
+                    _uiState.value = current
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                }
+        }
+    }
+
+    class Factory(
+        private val repository: CatalogRepository,
+        private val session: AuthSession,
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>): T =
+            NotificationsViewModel(repository, session) as T
     }
 }
 
@@ -567,9 +730,14 @@ private fun normalizeLibrarySort(library: Library, sort: LibrarySort): LibrarySo
 
 data class SearchUiState(
     val query: String = "",
+    val resultQuery: String = "",
     val loading: Boolean = false,
     val results: List<MediaItem> = emptyList(),
+    val totalRecordCount: Int = 0,
+    val nextPage: Int = 1,
+    val loadingMore: Boolean = false,
     val error: Boolean = false,
+    val loadMoreError: Boolean = false,
 )
 
 class SearchViewModel(
@@ -591,42 +759,104 @@ class SearchViewModel(
 
     fun updateQuery(value: String) {
         val generation = ++requestGeneration
+        val normalized = value.trim()
+        searchJob?.cancel()
         _uiState.value =
             _uiState.value.copy(
                 query = value,
-                loading = value.trim().length >= 2,
+                loading = normalized.isNotEmpty(),
                 error = false,
+                loadingMore = false,
+                loadMoreError = false,
+                nextPage = 1,
             )
-        searchJob?.cancel()
-        if (value.trim().length < 2) {
-            _uiState.value = _uiState.value.copy(loading = false, results = emptyList())
+        if (normalized.isEmpty()) {
+            _uiState.value =
+                _uiState.value.copy(
+                    loading = false,
+                    resultQuery = "",
+                    results = emptyList(),
+                    totalRecordCount = 0,
+                    nextPage = 1,
+                )
             return
         }
-        searchJob = viewModelScope.launch {
-            delay(300)
-            search(generation, value)
-        }
+        searchJob = viewModelScope.launch { search(generation, value, page = 1) }
     }
 
     fun retry() {
         val query = _uiState.value.query
-        if (query.trim().length < 2) return
+        if (query.trim().isEmpty()) return
         searchJob?.cancel()
         val generation = ++requestGeneration
-        searchJob = viewModelScope.launch { search(generation, query) }
+        _uiState.value =
+            _uiState.value.copy(
+                loading = true,
+                error = false,
+                loadingMore = false,
+                loadMoreError = false,
+                nextPage = 1,
+            )
+        searchJob = viewModelScope.launch { search(generation, query, page = 1) }
     }
 
-    private suspend fun search(generation: Long, query: String) {
+    fun loadMore() {
+        val state = _uiState.value
+        val query = state.resultQuery.ifBlank { state.query }.trim()
+        if (
+            query.isEmpty() ||
+                state.loading ||
+                state.loadingMore ||
+                state.results.size >= state.totalRecordCount
+        )
+            return
+        val generation = requestGeneration
+        val page = state.nextPage
+        _uiState.value = state.copy(loadingMore = true, loadMoreError = false)
+        searchJob = viewModelScope.launch {
+            runCatching { repository.search(session, query, page) }
+                .onSuccess { result ->
+                    if (generation != requestGeneration) return@onSuccess
+                    _uiState.update { current ->
+                        current.copy(
+                            results =
+                                uniqueSearchItems(
+                                    current.results + rankSearchResults(result.items, query)
+                                ),
+                            totalRecordCount = result.totalRecordCount,
+                            nextPage = page + 1,
+                            loadingMore = false,
+                            loadMoreError = false,
+                        )
+                    }
+                }
+                .onFailure {
+                    if (generation != requestGeneration) return@onFailure
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                    _uiState.update { current ->
+                        current.copy(loadingMore = false, loadMoreError = true)
+                    }
+                }
+        }
+    }
+
+    private suspend fun search(generation: Long, query: String, page: Int) {
         if (generation != requestGeneration) return
-        _uiState.value = _uiState.value.copy(loading = true)
-        runCatching { repository.search(session, query) }
-            .onSuccess {
+        _uiState.value = _uiState.value.copy(loading = page == 1)
+        runCatching { repository.search(session, query, page) }
+            .onSuccess { result ->
                 if (generation != requestGeneration) return@onSuccess
                 _uiState.value =
                     _uiState.value.copy(
                         loading = false,
-                        results = rankSearchResults(it, query),
+                        resultQuery = query.trim(),
+                        results = uniqueSearchItems(rankSearchResults(result.items, query)),
+                        totalRecordCount = result.totalRecordCount,
+                        nextPage = page + 1,
                         error = false,
+                        loadMoreError = false,
                     )
             }
             .onFailure {
@@ -796,6 +1026,11 @@ internal fun rankSearchResults(items: List<MediaItem>, query: String): List<Medi
         .map { it.third }
 }
 
+private fun uniqueSearchItems(items: List<MediaItem>): List<MediaItem> {
+    val seen = HashSet<String>()
+    return items.filter { seen.add(it.id) }
+}
+
 private const val LIBRARY_PAGE_SIZE = 40
 
 data class DetailUiState(
@@ -929,6 +1164,34 @@ class DetailViewModel(
         toggleItemState(playedAction = false) { item, value ->
             repository.setFavorite(session, item.id, value)
         }
+
+    fun toggleFollowing() {
+        val current = _uiState.value.data ?: return
+        val previous = current.item
+        if (previous.type !in setOf("Movie", "Series")) return
+        viewModelScope.launch {
+            val targetValue = !(previous.following ?: false)
+            _uiState.value =
+                _uiState.value.copy(
+                    data = current.copy(item = previous.copy(following = targetValue)),
+                    actionBusy = true,
+                    actionError = false,
+                )
+            runCatching { repository.setFollowing(session, previous.id, targetValue) }
+                .onFailure {
+                    if ((it as? CatalogException)?.statusCode == 401) {
+                        repository.clearSessionIfCurrent(session)
+                    }
+                    _uiState.value =
+                        _uiState.value.copy(
+                            data = current,
+                            actionBusy = false,
+                            actionError = true,
+                        )
+                }
+                .onSuccess { _uiState.value = _uiState.value.copy(actionBusy = false) }
+        }
+    }
 
     fun selectAudioTrack(streamIndex: Int) {
         val current = _uiState.value

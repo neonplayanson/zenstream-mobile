@@ -3,6 +3,7 @@ package com.zenstream.zenstreammobile.data
 import android.content.ContentResolver
 import android.net.Uri
 import com.zenstream.zenstreammobile.model.AuthSession
+import com.zenstream.zenstreammobile.model.CalendarResponse
 import com.zenstream.zenstreammobile.model.DerivedHomeData
 import com.zenstream.zenstreammobile.model.FavoriteSort
 import com.zenstream.zenstreammobile.model.HomeData
@@ -12,6 +13,7 @@ import com.zenstream.zenstreammobile.model.LibrarySort
 import com.zenstream.zenstreammobile.model.MediaItem
 import com.zenstream.zenstreammobile.model.PagedFavorites
 import com.zenstream.zenstreammobile.model.PagedLibrary
+import com.zenstream.zenstreammobile.model.PagedSearch
 import com.zenstream.zenstreammobile.model.PlaybackData
 import com.zenstream.zenstreammobile.model.PlaybackOptions
 import com.zenstream.zenstreammobile.model.PlayerEngine
@@ -19,7 +21,7 @@ import com.zenstream.zenstreammobile.model.SubtitleStyle
 import com.zenstream.zenstreammobile.model.ViewerCommandAck
 import com.zenstream.zenstreammobile.model.ViewerEnd
 import com.zenstream.zenstreammobile.model.ViewerHeartbeat
-import kotlinx.coroutines.CancellationException
+import java.time.Instant
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -36,6 +38,8 @@ interface CatalogRefreshSource {
     suspend fun clearSessionIfCurrent(session: AuthSession) {
         clearSession()
     }
+
+    suspend fun setFollowing(session: AuthSession, itemId: String, following: Boolean) {}
 }
 
 interface HomeDataSource : CatalogRefreshSource {
@@ -75,7 +79,7 @@ interface LibraryDataSource : CatalogRefreshSource {
 interface SearchDataSource : CatalogRefreshSource {
     override suspend fun clearSession()
 
-    suspend fun search(session: AuthSession, query: String): List<MediaItem>
+    suspend fun search(session: AuthSession, query: String, page: Int): PagedSearch
 }
 
 interface FavoritesDataSource : CatalogRefreshSource {
@@ -93,10 +97,29 @@ interface FavoritesDataSource : CatalogRefreshSource {
     suspend fun saveFavoriteSort(userId: String, sort: FavoriteSort)
 }
 
+interface CalendarDataSource : CatalogRefreshSource {
+    override suspend fun clearSession()
+
+    suspend fun calendar(
+        session: AuthSession,
+        start: Instant,
+        end: Instant,
+    ): CalendarResponse
+
+    suspend fun setCalendarFollowing(
+        session: AuthSession,
+        eventId: String,
+        following: Boolean,
+    ): Boolean
+}
+
 interface SettingsDataSource {
     val interfaceLocaleMode: Flow<InterfaceLocaleMode>
     val playerEngine: Flow<PlayerEngine>
     val showDebugIcon: Flow<Boolean>
+    val autoplayNextEpisode: Flow<Boolean>
+    val checkForUpdatesOnStartup: Flow<Boolean>
+    val watchHistoryEnabled: Flow<Boolean>
 
     suspend fun loadMetadataPreference(): MetadataPreference
 
@@ -107,6 +130,16 @@ interface SettingsDataSource {
     suspend fun savePlayerEngine(engine: PlayerEngine)
 
     suspend fun saveShowDebugIcon(enabled: Boolean)
+
+    suspend fun saveAutoplayNextEpisode(enabled: Boolean)
+
+    suspend fun saveCheckForUpdatesOnStartup(enabled: Boolean)
+
+    suspend fun loadWatchHistoryPreference(): Boolean
+
+    suspend fun saveWatchHistoryPreference(enabled: Boolean): Boolean
+
+    suspend fun clearWatchHistory()
 
     suspend fun loadSubtitleStyle(): SubtitleStyle
 
@@ -130,7 +163,13 @@ class CatalogRepository(
     private val api: CatalogApi,
     private val sessionStore: SessionStore,
     private val orchestratorApi: OrchestratorApi = OrchestratorApi(),
-) : HomeDataSource, LibraryDataSource, SearchDataSource, FavoritesDataSource, SettingsDataSource {
+) :
+    HomeDataSource,
+    LibraryDataSource,
+    SearchDataSource,
+    FavoritesDataSource,
+    CalendarDataSource,
+    SettingsDataSource {
 
     suspend fun revokeSession(session: AuthSession) = api.logout(session)
 
@@ -149,6 +188,9 @@ class CatalogRepository(
     val metadataLanguage: Flow<String> = sessionStore.metadataLanguage
     override val playerEngine: Flow<PlayerEngine> = sessionStore.playerEngine
     override val showDebugIcon: Flow<Boolean> = sessionStore.showDebugIcon
+    override val autoplayNextEpisode: Flow<Boolean> = sessionStore.autoplayNextEpisode
+    override val checkForUpdatesOnStartup: Flow<Boolean> = sessionStore.checkForUpdatesOnStartup
+    override val watchHistoryEnabled: Flow<Boolean> = sessionStore.watchHistoryEnabled
 
     suspend fun saveServerUrl(value: String) = sessionStore.saveServerUrl(normalizeServerUrl(value))
 
@@ -266,10 +308,6 @@ class CatalogRepository(
         } catch (error: OrchestratorException) {
             if (error.statusCode == 401) throw error
             null
-        } catch (error: CancellationException) {
-            throw error
-        } catch (_: Exception) {
-            null
         }
 
     private suspend fun <T> authenticatedOrchestratorRequest(
@@ -372,7 +410,8 @@ class CatalogRepository(
         sort: LibrarySort,
     ): PagedLibrary = api.fetchLibraryPage(session, library, startIndex, limit, sort)
 
-    override suspend fun search(session: AuthSession, query: String) = api.search(session, query)
+    override suspend fun search(session: AuthSession, query: String, page: Int) =
+        api.search(session, query, page)
 
     override suspend fun favoritesPage(
         session: AuthSession,
@@ -405,6 +444,47 @@ class CatalogRepository(
         api.setPlayed(session, itemId, played)
         invalidateHomeCache()
     }
+
+    override suspend fun setFollowing(session: AuthSession, itemId: String, following: Boolean) {
+        api.setFollowing(session, itemId, following)
+        invalidateCatalogState()
+    }
+
+    override suspend fun calendar(
+        session: AuthSession,
+        start: Instant,
+        end: Instant,
+    ): CalendarResponse = api.calendar(session, start, end)
+
+    override suspend fun setCalendarFollowing(
+        session: AuthSession,
+        eventId: String,
+        following: Boolean,
+    ): Boolean {
+        val result = api.setCalendarFollowing(session, eventId, following)
+        invalidateCatalogState()
+        return result
+    }
+
+    suspend fun notifications(
+        session: AuthSession,
+        limit: Int = 50,
+        cursor: String? = null,
+    ) = api.notifications(session, limit, cursor)
+
+    suspend fun notificationSummary(session: AuthSession) = api.notificationSummary(session)
+
+    suspend fun setNotificationRead(
+        session: AuthSession,
+        notificationId: String,
+        read: Boolean,
+    ) = api.setNotificationRead(session, notificationId, read)
+
+    suspend fun deleteNotification(session: AuthSession, notificationId: String) =
+        api.deleteNotification(session, notificationId)
+
+    suspend fun markAllNotificationsRead(session: AuthSession) =
+        api.markAllNotificationsRead(session)
 
     suspend fun playback(
         session: AuthSession,
@@ -485,16 +565,77 @@ class CatalogRepository(
     override suspend fun saveShowDebugIcon(enabled: Boolean) =
         sessionStore.saveShowDebugIcon(enabled)
 
+    override suspend fun saveAutoplayNextEpisode(enabled: Boolean) =
+        sessionStore.saveAutoplayNextEpisode(enabled)
+
+    override suspend fun saveCheckForUpdatesOnStartup(enabled: Boolean) =
+        sessionStore.saveCheckForUpdatesOnStartup(enabled)
+
     fun syncplayManager(session: AuthSession): SyncplayManager =
         SyncplaySession.manager(session, sessionStore)
 
-    override suspend fun loadSubtitleStyle(): SubtitleStyle =
-        sessionStore.cachedSubtitleStyle() ?: DEFAULT_SUBTITLE_STYLE
+    override suspend fun loadSubtitleStyle(): SubtitleStyle {
+        val local = sessionStore.cachedSubtitleStyle() ?: DEFAULT_SUBTITLE_STYLE
+        val current = session.first() ?: return local
+        return runCatching {
+                authenticatedOrchestratorRequest(current) {
+                    orchestratorApi.fetchSubtitlePreference(current.serverUrl, current.token)
+                }
+            }
+            .getOrNull()
+            ?.let { remote ->
+                remote.copy(bottomSpacing = local.bottomSpacing).also {
+                    sessionStore.cacheSubtitleStyle(it)
+                }
+            } ?: local
+    }
 
     override suspend fun saveSubtitleStyle(style: SubtitleStyle): SubtitleStyle {
         val normalized = normalizeSubtitleStyle(style)
-        sessionStore.cacheSubtitleStyle(normalized)
-        return normalized
+        val current = session.first()
+        val saved = current?.let {
+            runCatching {
+                    authenticatedOrchestratorRequest(it) {
+                        orchestratorApi.setSubtitlePreference(
+                            it.serverUrl,
+                            it.token,
+                            normalized,
+                        )
+                    }
+                }
+                .getOrNull()
+        }
+        val result = saved?.copy(bottomSpacing = normalized.bottomSpacing) ?: normalized
+        sessionStore.cacheSubtitleStyle(result)
+        return result
+    }
+
+    override suspend fun loadWatchHistoryPreference(): Boolean {
+        val current = session.first() ?: error("Authentication required")
+        return authenticatedOrchestratorRequest(current) {
+                orchestratorApi.fetchWatchHistoryPreference(current.serverUrl, current.token)
+            }
+            .also { sessionStore.saveWatchHistoryEnabled(it) }
+    }
+
+    override suspend fun saveWatchHistoryPreference(enabled: Boolean): Boolean {
+        val current = session.first() ?: error("Authentication required")
+        return authenticatedOrchestratorRequest(current) {
+                orchestratorApi.setWatchHistoryPreference(
+                    current.serverUrl,
+                    current.token,
+                    enabled,
+                )
+            }
+            .also { sessionStore.saveWatchHistoryEnabled(it) }
+    }
+
+    override suspend fun clearWatchHistory() {
+        val current = session.first() ?: error("Authentication required")
+        authenticatedOrchestratorRequest(current) {
+            orchestratorApi.clearWatchHistory(current.serverUrl, current.token)
+        }
+        invalidateCatalogState()
     }
 
     override suspend fun loadPlaybackPreference(): PlaybackPreference =

@@ -1,5 +1,7 @@
 package com.zenstream.zenstreammobile.ui.navigation
 
+import android.content.ContextWrapper
+import android.content.Intent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.material3.Text
 import androidx.compose.runtime.LaunchedEffect
@@ -20,6 +22,7 @@ import com.zenstream.zenstreammobile.R
 import com.zenstream.zenstreammobile.model.AuthSession
 import com.zenstream.zenstreammobile.ui.theme.ZenStreamTheme
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -46,6 +49,34 @@ class MainNavigationTest {
         assertTrue(!shouldShowMainSearchAction("search"))
         assertTrue(!shouldShowMainSearchAction("my-page"))
         assertTrue(!shouldShowMainSearchAction("detail"))
+    }
+
+    @Test
+    fun releasePageWithoutAnExternalHandlerDoesNotCrash() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+
+        assertFalse(openReleasePage(context, "zenstream-release-test://page"))
+    }
+
+    @Test
+    fun releasePageAddsNewTaskFlagForNonActivityContexts() {
+        val baseContext = InstrumentationRegistry.getInstrumentation().targetContext
+        var launchedIntent: Intent? = null
+        val context =
+            object : ContextWrapper(baseContext) {
+                override fun startActivity(intent: Intent) {
+                    launchedIntent = intent
+                }
+            }
+
+        assertTrue(
+            openReleasePage(
+                context,
+                "https://github.com/example/zenstream-mobile/releases/tag/v1.2.0",
+            )
+        )
+        val intent = requireNotNull(launchedIntent)
+        assertTrue(intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
     }
 
     @Test
