@@ -14,6 +14,9 @@ import androidx.compose.ui.test.swipeUp
 import androidx.test.platform.app.InstrumentationRegistry
 import com.zenstream.zenstreammobile.R
 import com.zenstream.zenstreammobile.model.AuthSession
+import com.zenstream.zenstreammobile.model.BazarrSearchResult
+import com.zenstream.zenstreammobile.model.BazarrStatus
+import com.zenstream.zenstreammobile.model.BazarrSubtitleMatch
 import com.zenstream.zenstreammobile.model.DetailData
 import com.zenstream.zenstreammobile.model.MediaItem
 import com.zenstream.zenstreammobile.model.MediaSource
@@ -21,6 +24,7 @@ import com.zenstream.zenstreammobile.model.MediaStream
 import com.zenstream.zenstreammobile.model.PlaybackTrackSelection
 import com.zenstream.zenstreammobile.ui.theme.ZenStreamTheme
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -374,5 +378,325 @@ class DetailScreensTest {
         composeRule.onNodeWithText(context.getString(R.string.subtitles_off)).performClick()
 
         assertEquals(null, selectedSubtitle)
+    }
+
+    @Test
+    fun matchedEpisodeWithoutSubtitleTracksShowsDownloaderOption() {
+        val episode = MediaItem("episode", "Pilot", type = "Episode")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = episode),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource("source-1", mediaStreams = listOf(MediaStream(1, "Audio"))),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = BazarrStatus("matched"),
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        composeRule
+            .onNodeWithText(context.getString(R.string.bazarr_find_subtitles))
+            .assertIsDisplayed()
+            .performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_subtitles)).assertIsDisplayed()
+    }
+
+    @Test
+    fun matchedMovieWithoutSubtitleTracksShowsDownloaderOption() {
+        val movie = MediaItem("movie", "Film", type = "Movie")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = movie),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource("source-1", mediaStreams = listOf(MediaStream(1, "Audio"))),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = BazarrStatus("matched"),
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        composeRule
+            .onNodeWithText(context.getString(R.string.bazarr_find_subtitles))
+            .assertIsDisplayed()
+            .performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_subtitles)).assertIsDisplayed()
+    }
+
+    @Test
+    fun matchedEpisodePlacesDownloaderAfterOffAndBeforeExistingSubtitleTracks() {
+        val episode = MediaItem("episode", "Pilot", type = "Episode")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = episode),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource(
+                            "source-1",
+                            mediaStreams =
+                                listOf(
+                                    MediaStream(1, "Audio"),
+                                    MediaStream(2, "Subtitle", displayTitle = "English"),
+                                ),
+                        ),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = BazarrStatus("matched"),
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        val subtitlesOffTop =
+            composeRule
+                .onNodeWithText(context.getString(R.string.subtitles_off))
+                .fetchSemanticsNode()
+                .boundsInRoot
+                .top
+        val downloaderTop =
+            composeRule
+                .onNodeWithText(context.getString(R.string.bazarr_find_subtitles))
+                .fetchSemanticsNode()
+                .boundsInRoot
+                .top
+        val existingSubtitleTop =
+            composeRule.onNodeWithText("English").fetchSemanticsNode().boundsInRoot.top
+
+        assertTrue(subtitlesOffTop < downloaderTop)
+        assertTrue(downloaderTop < existingSubtitleTop)
+    }
+
+    @Test
+    fun downloaderSheetShowsMatchesAndInvokesDownloadCallback() {
+        val episode = MediaItem("episode", "Pilot", type = "Episode")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        val searchResult =
+            BazarrSearchResult(
+                state = "matched",
+                matches =
+                    listOf(
+                        BazarrSubtitleMatch(
+                            matchId = "match-1",
+                            name = "Japanese subtitle",
+                            releaseName = "[SubsPlease] Show - 01 [1080p].srt",
+                            provider = "opensubtitles",
+                            language = "ja",
+                            score = 86.0,
+                            uploader = "excaliburrr",
+                            format = "srt",
+                        )
+                    ),
+            )
+        val status = mutableStateOf(BazarrStatus("matched"))
+        val search = mutableStateOf<BazarrSearchResult?>(null)
+        var downloadedMatchId: String? = null
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = episode),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource("source-1", mediaStreams = listOf(MediaStream(1, "Audio"))),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = status.value,
+                    bazarrSearch = search.value,
+                    onSearchBazarr = { search.value = searchResult },
+                    onDownloadBazarr = {
+                        downloadedMatchId = it
+                        status.value = status.value.copy(state = "download_started")
+                        search.value = null
+                    },
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_find_subtitles)).performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_find_subtitles)).performClick()
+        composeRule.onNodeWithText("[SubsPlease] Show - 01 [1080p].srt").assertIsDisplayed()
+        composeRule.onNodeWithText("86% · ja · opensubtitles · excaliburrr").assertIsDisplayed()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_download)).performClick()
+
+        assertEquals("match-1", downloadedMatchId)
+        composeRule
+            .onNodeWithText(context.getString(R.string.bazarr_download_queued))
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun movieDownloaderSheetShowsMatchesAndInvokesDownloadCallback() {
+        val movie = MediaItem("movie", "Film", type = "Movie")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        val searchResult =
+            BazarrSearchResult(
+                state = "matched",
+                matches =
+                    listOf(
+                        BazarrSubtitleMatch(
+                            matchId = "movie-match",
+                            name = "English subtitle",
+                            releaseName = null,
+                            provider = "opensubtitles",
+                            language = "en",
+                            score = null,
+                            uploader = null,
+                            format = "srt",
+                        )
+                    ),
+            )
+        val status = mutableStateOf(BazarrStatus("matched"))
+        val search = mutableStateOf<BazarrSearchResult?>(null)
+        var downloadedMatchId: String? = null
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = movie),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource("source-1", mediaStreams = listOf(MediaStream(1, "Audio"))),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = status.value,
+                    bazarrSearch = search.value,
+                    onSearchBazarr = { search.value = searchResult },
+                    onDownloadBazarr = {
+                        downloadedMatchId = it
+                        status.value = status.value.copy(state = "download_started")
+                        search.value = null
+                    },
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_find_subtitles)).performClick()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_find_subtitles)).performClick()
+        composeRule.onNodeWithText("— · en · opensubtitles · —").assertIsDisplayed()
+        composeRule.onNodeWithText(context.getString(R.string.bazarr_download)).performClick()
+
+        assertEquals("movie-match", downloadedMatchId)
+        composeRule
+            .onNodeWithText(context.getString(R.string.bazarr_download_queued))
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun unmatchedEpisodeHidesDownloaderAndSelectorWhenNoSubtitleTracksExist() {
+        val episode = MediaItem("episode", "Pilot", type = "Episode")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = episode),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource("source-1", mediaStreams = listOf(MediaStream(1, "Audio"))),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = BazarrStatus("unmatched"),
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).assertDoesNotExist()
+    }
+
+    @Test
+    fun unmatchedEpisodeKeepsTracksWithoutDownloaderAction() {
+        val episode = MediaItem("episode", "Pilot", type = "Episode")
+        val session = AuthSession("https://example.com", "token", "user", "name")
+        composeRule.setContent {
+            ZenStreamTheme {
+                DetailContent(
+                    data = DetailData(item = episode),
+                    session = session,
+                    padding = PaddingValues(),
+                    actionBusy = false,
+                    actionError = false,
+                    onPlay = {},
+                    onOpenItem = {},
+                    onSelectSeason = {},
+                    onTogglePlayed = {},
+                    onToggleFavorite = {},
+                    trackSource =
+                        MediaSource(
+                            "source-1",
+                            mediaStreams =
+                                listOf(
+                                    MediaStream(1, "Audio"),
+                                    MediaStream(2, "Subtitle", displayTitle = "English"),
+                                ),
+                        ),
+                    trackSelection = PlaybackTrackSelection(),
+                    bazarrStatus = BazarrStatus("ambiguous"),
+                )
+            }
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.onNodeWithText(context.getString(R.string.subtitle_track)).performClick()
+        composeRule
+            .onNodeWithText(context.getString(R.string.bazarr_find_subtitles))
+            .assertDoesNotExist()
     }
 }

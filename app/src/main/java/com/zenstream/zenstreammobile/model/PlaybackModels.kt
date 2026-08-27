@@ -29,6 +29,58 @@ data class MediaStream(
     val channels: Int? = null,
 )
 
+data class BazarrSubtitleSummary(
+    val language: String? = null,
+    val name: String? = null,
+    val provider: String? = null,
+    val hearingImpaired: Boolean = false,
+    val forced: Boolean = false,
+    val format: String? = null,
+)
+
+data class BazarrEpisodeStatus(
+    val seriesId: Int? = null,
+    val episodeId: Int? = null,
+    val title: String? = null,
+    val season: Int? = null,
+    val episode: Int? = null,
+    val subtitles: List<BazarrSubtitleSummary> = emptyList(),
+)
+
+data class BazarrMovieStatus(
+    val movieId: Int? = null,
+    val title: String? = null,
+    val subtitles: List<BazarrSubtitleSummary> = emptyList(),
+)
+
+data class BazarrStatus(
+    val state: String,
+    val relativePath: String? = null,
+    val hasLocalSubtitle: Boolean = false,
+    val message: String? = null,
+    val subtitles: List<BazarrSubtitleSummary> = emptyList(),
+    val episode: BazarrEpisodeStatus? = null,
+    val movie: BazarrMovieStatus? = null,
+)
+
+data class BazarrSubtitleMatch(
+    val matchId: String,
+    val name: String,
+    val releaseName: String? = null,
+    val provider: String? = null,
+    val language: String? = null,
+    val score: Double? = null,
+    val uploader: String? = null,
+    val format: String? = null,
+    val hearingImpaired: Boolean = false,
+    val forced: Boolean = false,
+)
+
+data class BazarrSearchResult(
+    val state: String,
+    val matches: List<BazarrSubtitleMatch> = emptyList(),
+)
+
 data class TrickplaySheet(
     val index: Int,
     val frameCount: Int,

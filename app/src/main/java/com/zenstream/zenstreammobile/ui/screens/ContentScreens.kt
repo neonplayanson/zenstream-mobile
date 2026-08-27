@@ -1,12 +1,6 @@
 package com.zenstream.zenstreammobile.ui.screens
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -116,11 +110,11 @@ import com.zenstream.zenstreammobile.ui.components.MediaRowView
 import com.zenstream.zenstreammobile.ui.components.POSTER_CARD_MIN_WIDTH
 import com.zenstream.zenstreammobile.ui.components.authenticatedImageRequest
 import com.zenstream.zenstreammobile.ui.components.itemSubtitle
+import com.zenstream.zenstreammobile.ui.navigation.ChromeVisibilitySlot
 import com.zenstream.zenstreammobile.ui.navigation.HIDE_DISTANCE_DP
 import com.zenstream.zenstreammobile.ui.navigation.MainNavigationBar
 import com.zenstream.zenstreammobile.ui.navigation.REVEAL_DISTANCE_DP
 import com.zenstream.zenstreammobile.ui.navigation.ScrollVisibilityController
-import com.zenstream.zenstreammobile.ui.navigation.StableChromeSlot
 
 @Composable
 fun HomeScreen(
@@ -372,11 +366,11 @@ fun SearchOverlayScreen(
                 revealDistance = with(density) { REVEAL_DISTANCE_DP.dp.toPx() },
             )
         }
-    var bottomBarVisible by remember { mutableStateOf(true) }
+    var bottomBarVisibilityFraction by remember { mutableStateOf(1f) }
 
     LaunchedEffect(Unit) {
         searchFocusRequester.requestFocus()
-        bottomBarVisible = bottomBarVisibility.resetForRoute()
+        bottomBarVisibilityFraction = bottomBarVisibility.resetForRoute()
     }
 
     Box(
@@ -390,19 +384,12 @@ fun SearchOverlayScreen(
             containerColor = Color.Transparent,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             bottomBar = {
-                StableChromeSlot(
-                    visible = bottomBarVisible,
+                ChromeVisibilitySlot(
+                    visibilityFraction = bottomBarVisibilityFraction,
                     modifier =
                         Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background),
+                    collapseFromBottom = true,
                     applyNavigationBarsPadding = true,
-                    enter =
-                        expandVertically(expandFrom = Alignment.Bottom) +
-                            slideInVertically(initialOffsetY = { it }) +
-                            fadeIn(),
-                    exit =
-                        shrinkVertically(shrinkTowards = Alignment.Bottom) +
-                            slideOutVertically(targetOffsetY = { it }) +
-                            fadeOut(),
                 ) {
                     MainNavigationBar(
                         currentRoute = currentRoute,
@@ -427,18 +414,14 @@ fun SearchOverlayScreen(
                     onItemClick(item)
                 },
                 onNestedScroll = { consumedY, availableY, isScrollable ->
-                    bottomBarVisible =
+                    bottomBarVisibilityFraction =
                         bottomBarVisibility.onNestedScroll(
                             consumedY = consumedY,
                             availableY = availableY,
                             isScrollable = isScrollable,
                         )
                 },
-                onScrollabilityChanged = { isScrollable ->
-                    if (!isScrollable) {
-                        bottomBarVisible = bottomBarVisibility.resetForRoute()
-                    }
-                },
+                onScrollabilityChanged = {},
                 searchFieldModifier = Modifier.focusRequester(searchFocusRequester),
                 showBackButton = true,
                 onBack = onDismiss,
@@ -475,7 +458,7 @@ private fun SearchResultsContent(
                 revealDistance = with(density) { 64.dp.toPx() },
             )
         }
-    var topBarVisible by remember { mutableStateOf(true) }
+    var topBarVisibilityFraction by remember { mutableStateOf(1f) }
     val topBarScrollConnection =
         remember(gridState) {
             object : NestedScrollConnection {
@@ -485,7 +468,7 @@ private fun SearchResultsContent(
                     source: NestedScrollSource,
                 ): Offset {
                     val isScrollable = gridState.canScrollForward || gridState.canScrollBackward
-                    topBarVisible =
+                    topBarVisibilityFraction =
                         topBarVisibility.onNestedScroll(
                             consumedY = consumed.y,
                             availableY = available.y,
@@ -497,7 +480,7 @@ private fun SearchResultsContent(
             }
         }
     LaunchedEffect(Unit) {
-        topBarVisible = topBarVisibility.resetForRoute()
+        topBarVisibilityFraction = topBarVisibility.resetForRoute()
     }
     LaunchedEffect(
         gridState,
@@ -525,25 +508,12 @@ private fun SearchResultsContent(
     }
     ObserveScrollability(
         canScroll = { gridState.canScrollForward || gridState.canScrollBackward },
-        onScrollabilityChanged = { isScrollable ->
-            onScrollabilityChanged(isScrollable)
-            if (!isScrollable) {
-                topBarVisible = topBarVisibility.resetForRoute()
-            }
-        },
+        onScrollabilityChanged = { isScrollable -> onScrollabilityChanged(isScrollable) },
     )
     Column(modifier.fillMaxSize().padding(padding)) {
-        StableChromeSlot(
-            visible = topBarVisible,
+        ChromeVisibilitySlot(
+            visibilityFraction = topBarVisibilityFraction,
             modifier = Modifier.fillMaxWidth(),
-            enter =
-                expandVertically(expandFrom = Alignment.Top) +
-                    slideInVertically(initialOffsetY = { -it }) +
-                    fadeIn(),
-            exit =
-                shrinkVertically(shrinkTowards = Alignment.Top) +
-                    slideOutVertically(targetOffsetY = { -it }) +
-                    fadeOut(),
         ) {
             Column {
                 if (showBackButton) {
@@ -1032,7 +1002,7 @@ fun LibraryScreen(
                 revealDistance = with(density) { 64.dp.toPx() },
             )
         }
-    var topBarVisible by remember { mutableStateOf(true) }
+    var topBarVisibilityFraction by remember { mutableStateOf(1f) }
     val topBarScrollConnection =
         remember(gridState) {
             object : NestedScrollConnection {
@@ -1041,7 +1011,7 @@ fun LibraryScreen(
                     available: Offset,
                     source: NestedScrollSource,
                 ): Offset {
-                    topBarVisible =
+                    topBarVisibilityFraction =
                         topBarVisibility.onNestedScroll(
                             consumedY = consumed.y,
                             availableY = available.y,
@@ -1053,16 +1023,11 @@ fun LibraryScreen(
             }
         }
     LaunchedEffect(Unit) {
-        topBarVisible = topBarVisibility.resetForRoute()
+        topBarVisibilityFraction = topBarVisibility.resetForRoute()
     }
     ObserveScrollability(
         canScroll = { gridState.canScrollForward || gridState.canScrollBackward },
-        onScrollabilityChanged = { isScrollable ->
-            if (!isScrollable) {
-                topBarVisible = topBarVisibility.resetForRoute()
-            }
-            onScrollabilityChanged(isScrollable)
-        },
+        onScrollabilityChanged = { isScrollable -> onScrollabilityChanged(isScrollable) },
     )
     LaunchedEffect(
         gridState,
@@ -1084,17 +1049,9 @@ fun LibraryScreen(
         }
     }
     Column(Modifier.fillMaxSize().padding(padding)) {
-        StableChromeSlot(
-            visible = topBarVisible,
+        ChromeVisibilitySlot(
+            visibilityFraction = topBarVisibilityFraction,
             modifier = Modifier.fillMaxWidth(),
-            enter =
-                expandVertically(expandFrom = Alignment.Top) +
-                    slideInVertically(initialOffsetY = { -it }) +
-                    fadeIn(),
-            exit =
-                shrinkVertically(shrinkTowards = Alignment.Top) +
-                    slideOutVertically(targetOffsetY = { -it }) +
-                    fadeOut(),
         ) {
             Column {
                 if (state.libraries.isNotEmpty()) {

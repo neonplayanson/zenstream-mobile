@@ -6,6 +6,12 @@ import android.os.Build
 import android.util.Log
 import com.zenstream.zenstreammobile.BuildConfig
 import com.zenstream.zenstreammobile.model.AuthSession
+import com.zenstream.zenstreammobile.model.BazarrEpisodeStatus
+import com.zenstream.zenstreammobile.model.BazarrMovieStatus
+import com.zenstream.zenstreammobile.model.BazarrSearchResult
+import com.zenstream.zenstreammobile.model.BazarrStatus
+import com.zenstream.zenstreammobile.model.BazarrSubtitleMatch
+import com.zenstream.zenstreammobile.model.BazarrSubtitleSummary
 import com.zenstream.zenstreammobile.model.CalendarEvent
 import com.zenstream.zenstreammobile.model.CalendarResponse
 import com.zenstream.zenstreammobile.model.DerivedHomeData
@@ -320,6 +326,52 @@ class CatalogApi(
             )
         }
 
+    suspend fun bazarrStatus(
+        session: AuthSession,
+        itemId: String,
+        sourceId: String,
+    ): BazarrStatus =
+        withContext(Dispatchers.IO) {
+            parseBazarrStatus(
+                requestJson(
+                    session,
+                    "/api/catalog/items/${android.net.Uri.encode(itemId)}/bazarr/status",
+                    query = mapOf("sourceId" to sourceId),
+                )
+            )
+        }
+
+    suspend fun searchBazarrSubtitles(
+        session: AuthSession,
+        itemId: String,
+        sourceId: String,
+    ): BazarrSearchResult =
+        withContext(Dispatchers.IO) {
+            parseBazarrSearchResult(
+                requestJson(
+                    session,
+                    "/api/catalog/items/${android.net.Uri.encode(itemId)}/bazarr/search",
+                    method = "POST",
+                    body = JSONObject().put("sourceId", sourceId).toString(),
+                )
+            )
+        }
+
+    suspend fun downloadBazarrSubtitle(
+        session: AuthSession,
+        itemId: String,
+        sourceId: String,
+        matchId: String,
+    ) =
+        withContext(Dispatchers.IO) {
+            requestJson(
+                session,
+                "/api/catalog/items/${android.net.Uri.encode(itemId)}/bazarr/download",
+                method = "POST",
+                body = JSONObject().put("sourceId", sourceId).put("matchId", matchId).toString(),
+            )
+        }
+
     private suspend fun playbackSegments(
         session: AuthSession,
         itemId: String,
@@ -504,7 +556,15 @@ class CatalogApi(
                             sourceId?.takeIf(String::isNotBlank)?.let { put("sourceId", it) }
                         },
                 )
-            parseTrickplayManifest(manifest, session.serverUrl)
+            parseTrickplayManifest(manifest, session.serverUrl, sourceId).also { parsed ->
+                if (parsed == null) {
+                    val keys = manifest.keys().asSequence().take(12).joinToString(",")
+                    Log.w(
+                        PLAYBACK_TAG,
+                        "trickplay manifest parse rejected item=$itemId source=${sourceId ?: "auto"} responseKeys=$keys",
+                    )
+                }
+            }
         }
 
     suspend fun subtitleWebVtt(
@@ -1696,11 +1756,108 @@ internal fun parseMediaSource(source: JSONObject): MediaSource {
     )
 }
 
+private fun parseBazarrStatus(value: JSONObject): BazarrStatus {
+    val episode = value.optJSONObject("episode")
+    val movie = value.optJSONObject("movie")
+
+    fun parseSubtitles(owner: JSONObject?): List<BazarrSubtitleSummary> =
+        owner
+            ?.optJSONArray("subtitles")
+            ?.let { array ->
+                List(array.length()) { index -> array.optJSONObject(index) ?: JSONObject() }
+                    .map { subtitle ->
+                        BazarrSubtitleSummary(
+                            language = subtitle.optNullableString("language"),
+                            name = subtitle.optNullableString("name"),
+                            provider = subtitle.optNullableString("provider"),
+                            hearingImpaired = subtitle.optBoolean("hearingImpaired"),
+                            forced = subtitle.optBoolean("forced"),
+                            format = subtitle.optNullableString("format"),
+                        )
+                    }
+            }
+            .orEmpty()
+    val episodeSubtitles = parseSubtitles(episode)
+    val movieSubtitles = parseSubtitles(movie)
+    return BazarrStatus(
+        state = value.optString("state").ifBlank { "unknown" },
+        relativePath = value.optNullableString("relativePath"),
+        hasLocalSubtitle = value.optBoolean("hasLocalSubtitle"),
+        message = value.optNullableString("message"),
+        subtitles = episodeSubtitles.ifEmpty { movieSubtitles },
+        episode =
+            episode?.let {
+                BazarrEpisodeStatus(
+                    seriesId = it.optIntOrNull("seriesId"),
+                    episodeId = it.optIntOrNull("episodeId"),
+                    title = it.optNullableString("title"),
+                    season = it.optIntOrNull("season"),
+                    episode = it.optIntOrNull("episode"),
+                    subtitles = episodeSubtitles,
+                )
+            },
+        movie =
+            movie?.let {
+                BazarrMovieStatus(
+                    movieId = it.optIntOrNull("movieId"),
+                    title = it.optNullableString("title"),
+                    subtitles = movieSubtitles,
+                )
+            },
+    )
+}
+
+private fun parseBazarrSearchResult(value: JSONObject): BazarrSearchResult {
+    val matches =
+        value
+            .optJSONArray("matches")
+            ?.let { array ->
+                List(array.length()) { index -> array.optJSONObject(index) ?: JSONObject() }
+                    .mapNotNull { match ->
+                        val matchId =
+                            match.optString("matchId").takeIf { it.isNotBlank() }
+                                ?: return@mapNotNull null
+                        BazarrSubtitleMatch(
+                            matchId = matchId,
+                            name = match.optString("name").ifBlank { "Subtitle" },
+                            releaseName = match.optNullableString("releaseName"),
+                            provider = match.optNullableString("provider"),
+                            language = match.optNullableString("language"),
+                            score = match.optDoubleOrNull("score"),
+                            uploader = match.optNullableString("uploader"),
+                            format = match.optNullableString("format"),
+                            hearingImpaired = match.optBoolean("hearingImpaired"),
+                            forced = match.optBoolean("forced"),
+                        )
+                    }
+            }
+            .orEmpty()
+    return BazarrSearchResult(
+        state = value.optString("state").ifBlank { "no_matches" },
+        matches = matches,
+    )
+}
+
 internal fun withNegotiatedPlaybackUrl(source: MediaSource, url: String?): MediaSource =
     source.copy(url = url?.trim()?.takeIf(String::isNotBlank) ?: source.url)
 
-internal fun parseTrickplayManifest(value: JSONObject?, serverUrl: String): TrickplayManifest? {
-    val manifest = value ?: return null
+internal fun parseTrickplayManifest(
+    value: JSONObject?,
+    serverUrl: String,
+    requestedSourceId: String? = null,
+): TrickplayManifest? {
+    val response = value ?: return null
+    val manifest =
+        response.optJSONObject("trickplay")
+            ?: response.optJSONObject("sources")?.let { sources ->
+                when {
+                    requestedSourceId != null -> sources.optJSONObject(requestedSourceId)
+                    sources.length() == 1 -> sources.optJSONObject(sources.keys().next())
+                    else -> null
+                }
+            }
+            ?: response.takeUnless { response.has("sources") }
+            ?: return null
     val sheets = manifest.optJSONArray("sheets") ?: manifest.optJSONArray("sheetList")
     val parsedSheets =
         List(sheets?.length() ?: 0) { sheets?.optJSONObject(it) }
@@ -1713,16 +1870,22 @@ internal fun parseTrickplayManifest(value: JSONObject?, serverUrl: String): Tric
                 TrickplaySheet(index, frameCount, url)
             }
     return TrickplayManifest(
-        state = manifest.optStringAny("state") ?: return null,
-        sourceId = manifest.optStringAny("sourceId", "source_id") ?: return null,
-        frameWidth = manifest.optIntAny("frameWidth", "frame_width") ?: return null,
-        frameHeight = manifest.optIntAny("frameHeight", "frame_height") ?: return null,
+        state = manifest.optStringAny("state", "status")?.lowercase() ?: return null,
+        sourceId =
+            manifest.optStringAny("sourceId", "source_id") ?: requestedSourceId ?: return null,
+        frameWidth =
+            manifest.optIntAny("frameWidth", "frame_width", "width", "Width") ?: return null,
+        frameHeight =
+            manifest.optIntAny("frameHeight", "frame_height", "height", "Height") ?: return null,
         intervalSeconds =
-            manifest.optDoubleAny("intervalSeconds", "interval_seconds") ?: return null,
-        columns = manifest.optIntAny("columns") ?: return null,
-        rows = manifest.optIntAny("rows") ?: return null,
+            manifest.optDoubleAny("intervalSeconds", "interval_seconds")
+                ?: manifest.optDoubleAny("interval", "Interval")?.div(1_000.0)
+                ?: return null,
+        columns = manifest.optIntAny("columns", "tileWidth", "TileWidth") ?: return null,
+        rows = manifest.optIntAny("rows", "tileHeight", "TileHeight") ?: return null,
         frameCount =
-            manifest.optIntAny("frameCount", "frame_count") ?: parsedSheets.sumOf { it.frameCount },
+            manifest.optIntAny("frameCount", "frame_count", "thumbnailCount", "ThumbnailCount")
+                ?: parsedSheets.sumOf { it.frameCount },
         sheets = parsedSheets,
     )
 }
@@ -1737,8 +1900,8 @@ private fun JSONObject.optDoubleAny(vararg keys: String): Double? =
     keys.asSequence().mapNotNull { optDoubleOrNull(it) }.firstOrNull()
 
 private fun resolveTrickplayUrl(serverUrl: String, value: String): String? =
-    runCatching { value.toHttpUrl().toString() }.getOrNull()
-        ?: value.takeIf { it.startsWith('/') }?.let { serverUrl.trimEnd('/') + it }
+    runCatching { value.trim().toHttpUrl().toString() }.getOrNull()
+        ?: runCatching { serverUrl.toHttpUrl().resolve(value.trim())?.toString() }.getOrNull()
 
 internal fun playbackMimeType(source: MediaSource, bitrate: Int = 0): String? {
     val negotiatedUrl = source.url

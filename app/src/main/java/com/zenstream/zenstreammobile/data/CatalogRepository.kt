@@ -3,6 +3,8 @@ package com.zenstream.zenstreammobile.data
 import android.content.ContentResolver
 import android.net.Uri
 import com.zenstream.zenstreammobile.model.AuthSession
+import com.zenstream.zenstreammobile.model.BazarrSearchResult
+import com.zenstream.zenstreammobile.model.BazarrStatus
 import com.zenstream.zenstreammobile.model.CalendarResponse
 import com.zenstream.zenstreammobile.model.DerivedHomeData
 import com.zenstream.zenstreammobile.model.FavoriteSort
@@ -498,6 +500,22 @@ class CatalogRepository(
     suspend fun playbackSource(session: AuthSession, itemId: String) =
         api.playbackSource(session, itemId)
 
+    suspend fun bazarrStatus(session: AuthSession, itemId: String, sourceId: String): BazarrStatus =
+        api.bazarrStatus(session, itemId, sourceId)
+
+    suspend fun searchBazarrSubtitles(
+        session: AuthSession,
+        itemId: String,
+        sourceId: String,
+    ): BazarrSearchResult = api.searchBazarrSubtitles(session, itemId, sourceId)
+
+    suspend fun downloadBazarrSubtitle(
+        session: AuthSession,
+        itemId: String,
+        sourceId: String,
+        matchId: String,
+    ) = api.downloadBazarrSubtitle(session, itemId, sourceId, matchId)
+
     suspend fun episodeNeighbors(session: AuthSession, item: MediaItem): EpisodeNeighbors =
         api.episodeNeighbors(session, item)
 
@@ -575,39 +593,13 @@ class CatalogRepository(
         SyncplaySession.manager(session, sessionStore)
 
     override suspend fun loadSubtitleStyle(): SubtitleStyle {
-        val local = sessionStore.cachedSubtitleStyle() ?: DEFAULT_SUBTITLE_STYLE
-        val current = session.first() ?: return local
-        return runCatching {
-                authenticatedOrchestratorRequest(current) {
-                    orchestratorApi.fetchSubtitlePreference(current.serverUrl, current.token)
-                }
-            }
-            .getOrNull()
-            ?.let { remote ->
-                remote.copy(bottomSpacing = local.bottomSpacing).also {
-                    sessionStore.cacheSubtitleStyle(it)
-                }
-            } ?: local
+        return sessionStore.cachedSubtitleStyle() ?: DEFAULT_SUBTITLE_STYLE
     }
 
     override suspend fun saveSubtitleStyle(style: SubtitleStyle): SubtitleStyle {
         val normalized = normalizeSubtitleStyle(style)
-        val current = session.first()
-        val saved = current?.let {
-            runCatching {
-                    authenticatedOrchestratorRequest(it) {
-                        orchestratorApi.setSubtitlePreference(
-                            it.serverUrl,
-                            it.token,
-                            normalized,
-                        )
-                    }
-                }
-                .getOrNull()
-        }
-        val result = saved?.copy(bottomSpacing = normalized.bottomSpacing) ?: normalized
-        sessionStore.cacheSubtitleStyle(result)
-        return result
+        sessionStore.cacheSubtitleStyle(normalized)
+        return normalized
     }
 
     override suspend fun loadWatchHistoryPreference(): Boolean {
