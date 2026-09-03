@@ -1,6 +1,8 @@
 package com.zenstream.zenstreammobile.ui
 
 import com.zenstream.zenstreammobile.model.SyncplayGroup
+import com.zenstream.zenstreammobile.ui.player.EngineState
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +37,17 @@ internal fun syncplayTimelineTarget(
     return SyncplayTimelineTarget(position, shouldPlay, startDelayMillis)
 }
 
+internal fun syncplayTimelineIsSettled(
+    room: SyncplayGroup?,
+    itemId: String,
+    engine: EngineState,
+    serverNow: Double,
+): Boolean {
+    if (room?.itemId != itemId || !engine.ready || engine.isBuffering) return false
+    val target = syncplayTimelineTarget(room, serverNow).positionSeconds
+    return abs(engine.positionSeconds - target) <= SYNCPLAY_SETTLE_TOLERANCE_SECONDS
+}
+
 internal fun sameSyncplayTimeline(left: SyncplayGroup, right: SyncplayGroup): Boolean =
     left.id == right.id &&
         left.itemId == right.itemId &&
@@ -49,8 +62,8 @@ internal fun syncplayWaitingForMembers(room: SyncplayGroup?, itemId: String): Bo
     return room.resumeWhenReady &&
         room.members.any { member ->
             member.watchingTogether &&
-                member.viewing &&
-                (member.loading || member.readyGeneration != room.mediaGeneration)
+                (member.loading ||
+                    (member.viewing && member.readyGeneration != room.mediaGeneration))
         }
 }
 
@@ -105,3 +118,4 @@ internal class SyncplayTimelineScheduler(
 
 private const val START_GRACE_MILLIS = 20L
 private const val RECONCILIATION_INTERVAL_MILLIS = 1_000L
+private const val SYNCPLAY_SETTLE_TOLERANCE_SECONDS = 1.5

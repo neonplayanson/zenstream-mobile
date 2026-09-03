@@ -22,6 +22,7 @@ import com.zenstream.zenstreammobile.model.MediaStream
 import com.zenstream.zenstreammobile.model.PlaybackData
 import com.zenstream.zenstreammobile.model.PlaybackOptions
 import com.zenstream.zenstreammobile.model.PlaybackSegment
+import com.zenstream.zenstreammobile.model.PlaybackTimeDisplayMode
 import com.zenstream.zenstreammobile.model.PlayerEngine
 import com.zenstream.zenstreammobile.model.SubtitleCue
 import com.zenstream.zenstreammobile.model.SubtitleStyle
@@ -51,6 +52,7 @@ data class PlaybackUiState(
     val itemId: String = "",
     val playback: PlaybackData? = null,
     val engineType: PlayerEngine = PlayerEngine.MPV,
+    val timeDisplayMode: PlaybackTimeDisplayMode = PlaybackTimeDisplayMode.Remaining,
     val showDebugIcon: Boolean = false,
     val autoplayNextEpisode: Boolean = true,
     val watchHistoryEnabled: Boolean = true,
@@ -221,11 +223,15 @@ class PlaybackViewModel(
     private val viewerCommandAcks = mutableListOf<ViewerCommandAck>()
     private val closeCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var closeCleanupJob: Job? = null
+    private var backgrounded = false
+    private var backgroundRecoveryJob: Job? = null
+    private var backgroundRecoveryGeneration = 0L
 
     init {
         subtitleSelectionInitialized = hasInitialSubtitleSelection
         viewModelScope.launch {
             val engineType = repository.playerEngine.first()
+            val timeDisplayMode = repository.playbackTimeDisplayMode.first()
             val autoplayNextEpisode = repository.autoplayNextEpisode.first()
             val watchHistoryEnabled =
                 runCatching { repository.loadWatchHistoryPreference() }
@@ -235,6 +241,7 @@ class PlaybackViewModel(
             _uiState.value =
                 _uiState.value.copy(
                     engineType = engineType,
+                    timeDisplayMode = timeDisplayMode,
                     autoplayNextEpisode = autoplayNextEpisode,
                     watchHistoryEnabled = watchHistoryEnabled,
                     subtitleStyle = subtitleStyle,
@@ -279,18 +286,19 @@ class PlaybackViewModel(
         engineJob = viewModelScope.launch {
             playbackEngine?.state?.collectLatest { state ->
                 _uiState.value = _uiState.value.copy(engine = state, error = state.error)
-                val room = syncplay?.state?.value?.active
+                val manager = syncplay
+                val room = manager?.state?.value?.active
                 if (
                     _uiState.value.syncplaySettling &&
-                        room?.itemId == currentItemId &&
-                        state.ready &&
-                        !state.isBuffering &&
-                        kotlin.math.abs(
-                            state.positionSeconds -
-                                syncplayTimelineTarget(room, syncplay.serverNow()).positionSeconds
-                        ) <= 1.5
+                        syncplayTimelineIsSettled(
+                            room,
+                            currentItemId,
+                            state,
+                            manager?.serverNow() ?: 0.0,
+                        )
                 ) {
                     _uiState.value = _uiState.value.copy(syncplaySettling = false)
+                    manager?.reportPresence(viewing = true, loading = false)
                 }
                 if (state.error != null) {
                     Log.w(
@@ -438,6 +446,7 @@ class PlaybackViewModel(
                             _uiState.value =
                                 _uiState.value.copy(
                                     loading = false,
+                                    syncplaySettling = false,
                                     error = it.message ?: "Playback failed",
                                 )
                             transitionInProgress = false
@@ -497,6 +506,7 @@ class PlaybackViewModel(
                         _uiState.value =
                             _uiState.value.copy(
                                 loading = false,
+                                syncplaySettling = false,
                                 error =
                                     error.message
                                         ?: "Playback response did not include a usable stream URL",
@@ -857,8 +867,68 @@ class PlaybackViewModel(
     }
 
     fun pauseForBackground() {
+        backgrounded = true
+        backgroundRecoveryGeneration++
+        backgroundRecoveryJob?.cancel()
+        playbackGeneration++
+        playbackLoadJob?.cancel()
+        viewerHeartbeatJob?.cancel()
+        syncplayTimelineKey = null
         playbackEngine?.pause()
-        _uiState.value = _uiState.value.copy(engine = _uiState.value.engine.copy(isPlaying = false))
+        _uiState.value =
+            _uiState.value.copy(
+                engine = _uiState.value.engine.copy(isPlaying = false),
+                syncplaySettling = false,
+            )
+    }
+
+    fun recoverFromBackground(): Boolean? {
+        if (!backgrounded) return null
+        backgrounded = false
+        backgroundRecoveryJob?.cancel()
+        val recoveryGeneration = ++backgroundRecoveryGeneration
+        syncplayTimelineKey = null
+        val current = _uiState.value
+        val needsPlaybackLoad =
+            current.playback == null ||
+                current.loading ||
+                current.error != null ||
+                !current.engine.ready ||
+                current.engine.isBuffering
+        if (needsPlaybackLoad) {
+            loadPlayback(
+                PlaybackOptions(startPositionSeconds = currentPlayerPositionSeconds()),
+                playWhenReadyOverride = false,
+            )
+        } else {
+            startViewerHeartbeat()
+        }
+        backgroundRecoveryJob = viewModelScope.launch {
+            delay(BACKGROUND_RECOVERY_TIMEOUT_MILLIS)
+            if (recoveryGeneration != backgroundRecoveryGeneration) return@launch
+            val latest = _uiState.value
+            if (latest.error != null) {
+                if (latest.syncplaySettling) {
+                    _uiState.value = latest.copy(syncplaySettling = false)
+                }
+                return@launch
+            }
+            if (
+                latest.playback == null ||
+                    latest.loading ||
+                    !latest.engine.ready ||
+                    latest.syncplaySettling
+            ) {
+                _uiState.value =
+                    latest.copy(
+                        loading = false,
+                        syncplaySettling = false,
+                        error = "Playback did not recover after returning to the app",
+                    )
+                syncplay?.reportPresence(viewing = false, loading = false, immediate = true)
+            }
+        }
+        return needsPlaybackLoad
     }
 
     fun seekBy(deltaSeconds: Double) {
@@ -1094,6 +1164,12 @@ class PlaybackViewModel(
         viewModelScope.launch { repository.saveSubtitleStyle(next) }
     }
 
+    fun toggleTimeDisplayMode() {
+        val next = _uiState.value.timeDisplayMode.toggled()
+        _uiState.value = _uiState.value.copy(timeDisplayMode = next)
+        viewModelScope.launch { repository.savePlaybackTimeDisplayMode(next) }
+    }
+
     fun flushProgress() {
         val now = SystemClock.elapsedRealtime()
         if (lastProgressFlushAt != 0L && now - lastProgressFlushAt < PROGRESS_FLUSH_DEBOUNCE_MILLIS)
@@ -1118,6 +1194,7 @@ class PlaybackViewModel(
         trickplayJob?.cancel()
         subtitleJob?.cancel()
         episodeNeighborsJob?.cancel()
+        backgroundRecoveryJob?.cancel()
         engineJob?.cancel()
         playbackEngine?.release()
         playbackEngine = null
@@ -1130,6 +1207,7 @@ class PlaybackViewModel(
 
     private companion object {
         const val PROGRESS_FLUSH_DEBOUNCE_MILLIS = 1_000L
+        const val BACKGROUND_RECOVERY_TIMEOUT_MILLIS = 10_000L
     }
 
     class Factory(
