@@ -51,6 +51,7 @@ import java.time.Instant
 import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -72,6 +73,9 @@ data class EpisodeNeighbors(
     val previous: MediaItem? = null,
     val next: MediaItem? = null,
 )
+
+internal const val HOME_FEATURED_LIST_LIMIT = 25
+internal const val HOME_FEATURED_ITEM_LIMIT = 5
 
 class CatalogApi(
     private val httpClient: OkHttpClient = OkHttpClient(),
@@ -713,9 +717,12 @@ class CatalogApi(
 
     suspend fun fetchHomeFeatured(session: AuthSession): List<MediaItem> =
         withContext(Dispatchers.IO) {
-            catalogItems(homeSection(session, "featured"), "latestItems")
-                .filter { it.backdropImageTags.isNotEmpty() }
-                .take(5)
+            selectRandomFeaturedItems(
+                catalogItems(
+                    homeSection(session, "featured", HOME_FEATURED_LIST_LIMIT),
+                    "latestItems",
+                )
+            )
         }
 
     suspend fun fetchHomeContinueWatching(session: AuthSession): List<MediaItem> =
@@ -733,10 +740,14 @@ class CatalogApi(
             parseDerivedHomeData(homeSection(session, "derived"))
         }
 
-    private suspend fun homeSection(session: AuthSession, section: String): JSONObject =
+    private suspend fun homeSection(
+        session: AuthSession,
+        section: String,
+        limit: Int? = null,
+    ): JSONObject =
         requestJson(
             session,
-            "/api/catalog/home?section=${android.net.Uri.encode(section)}",
+            homeSectionPath(section, limit),
             requestTimeoutMillis = HOME_REQUEST_TIMEOUT_MILLIS,
         )
 
@@ -993,14 +1004,14 @@ class CatalogApi(
                         session,
                         "/api/catalog/items/${android.net.Uri.encode(itemId)}/detail$suffix",
                     )
-                return@withContext DetailData(
-                    item = catalogMediaItem(payload.getJSONObject("item")),
-                    parentSeries = payload.optJSONObject("backgroundItem")?.let(::catalogMediaItem),
-                    seasons = catalogItems(payload, "seasons"),
-                    episodes = catalogItems(payload, "episodes"),
-                    similar = catalogItems(payload, "similar"),
-                    selectedSeasonId = payload.optString("selectedSeasonId").ifBlank { null },
-                )
+                val data = parseDetailData(payload)
+                return@withContext if (
+                    data.item.type == "BoxSet" && !payload.has("collectionItems")
+                ) {
+                    data.copy(collectionItems = getChildren(session, data.item))
+                } else {
+                    data
+                }
             } catch (error: CatalogException) {
                 if (error.statusCode != 404 && error.statusCode != 405) throw error
             }
@@ -1021,12 +1032,15 @@ class CatalogApi(
                 if (seriesId != null && selectedSeason != null) {
                     getEpisodes(session, seriesId, selectedSeason.id)
                 } else emptyList()
+            val collectionItems =
+                if (item.type == "BoxSet") getChildren(session, item) else emptyList()
             val similar = if (item.type == "Episode") emptyList() else getSimilar(session, item.id)
             DetailData(
                 item = item,
                 parentSeries = parentSeries,
                 seasons = seasons,
                 episodes = episodes,
+                collectionItems = collectionItems,
                 similar = similar,
                 selectedSeasonId = selectedSeason?.id,
             )
@@ -1421,6 +1435,38 @@ internal fun parseCalendarResponse(root: JSONObject): CalendarResponse {
 internal fun catalogItems(root: JSONObject, key: String = "items"): List<MediaItem> =
     jsonArray(root, key).map(::catalogMediaItem).distinctBy { it.id }
 
+internal fun parseDetailData(payload: JSONObject): DetailData {
+    val item = catalogMediaItem(payload.getJSONObject("item"))
+    return DetailData(
+        item = item,
+        parentSeries = payload.optJSONObject("backgroundItem")?.let(::catalogMediaItem),
+        seasons = catalogItems(payload, "seasons"),
+        episodes = catalogItems(payload, "episodes"),
+        collectionItems = catalogItems(payload, "collectionItems"),
+        similar = catalogItems(payload, "similar"),
+        selectedSeasonId = payload.optString("selectedSeasonId").ifBlank { null },
+    )
+}
+
+internal fun selectRandomFeaturedItems(
+    items: List<MediaItem>,
+    random: Random = Random.Default,
+): List<MediaItem> =
+    items
+        .filter { it.backdropImageTags.isNotEmpty() }
+        .shuffled(random)
+        .take(HOME_FEATURED_ITEM_LIMIT)
+
+internal fun homeSectionPath(
+    section: String,
+    limit: Int? = null,
+    encode: (String) -> String = android.net.Uri::encode,
+): String = buildString {
+    append("/api/catalog/home?section=")
+    append(encode(section))
+    if (limit != null) append("&limit=").append(limit)
+}
+
 internal fun parseHomeData(payload: JSONObject): HomeData {
     val globalRows =
         listOfNotNull(
@@ -1454,10 +1500,7 @@ internal fun parseHomeData(payload: JSONObject): HomeData {
                 }
         }
     return HomeData(
-        featured =
-            catalogItems(payload, "latestItems")
-                .filter { it.backdropImageTags.isNotEmpty() }
-                .take(5),
+        featured = selectRandomFeaturedItems(catalogItems(payload, "latestItems")),
         rows = orderedHomeRows(globalRows + parseDerivedHomeData(payload).rows() + libraryRows),
     )
 }
@@ -1615,6 +1658,7 @@ internal fun catalogMediaItem(item: JSONObject): MediaItem {
                 metadata.optString("releaseDate").ifBlank { null }
             },
         productionYear = metadata.optIntOrNull("year"),
+        collectionYearRange = item.optString("collectionYearRange").ifBlank { null },
         officialRating =
             metadata
                 .optString("officialRating")
@@ -1993,6 +2037,7 @@ fun parseMediaItems(json: JSONObject): List<MediaItem> =
             overview = item.optString("Overview").ifBlank { null },
             premiereDate = item.optString("PremiereDate").ifBlank { null },
             productionYear = item.optIntOrNull("ProductionYear"),
+            collectionYearRange = item.optString("CollectionYearRange").ifBlank { null },
             officialRating = item.optString("OfficialRating").ifBlank { null },
             communityRating = item.optDoubleOrNull("CommunityRating"),
             genres = stringArray(item, "Genres"),
