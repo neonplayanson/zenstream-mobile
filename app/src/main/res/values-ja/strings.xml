@@ -37,6 +37,8 @@
     <string name="newly_added">新着</string>
     <string name="play_next">次のエピソードを再生</string>
     <string name="stop_playing">再生を停止</string>
+    <string name="audio_loading">音声を読み込み中</string>
+    <string name="audio_video_handoff_failed">音声プレーヤーを切り離せませんでした。もう一度動画を開いてください。</string>
     <string name="newly_added_on">%1$s の新着</string>
     <string name="top_rated">高評価</string>
     <string name="top_rated_on">%1$s の高評価</string>
@@ -153,6 +155,17 @@
     <string name="settings_version_value">&#x30D0;&#x30FC;&#x30B8;&#x30E7;&#x30F3; %1$s</string>
     <string name="player_engine_media3">Media3</string>
     <string name="player_engine_mpv">MPV</string>
+    <string name="player_mpv_advanced_warning">MPVの詳細設定です。詳しい知識がない場合は変更しないでください。</string>
+    <string name="player_mpv_settings_apply_note">変更は次回ビデオプレーヤーを開いたときに適用されます。</string>
+    <string name="player_mpv_video_output">MPV映像出力</string>
+    <string name="player_mpv_video_output_gpu">GPU（安定）</string>
+    <string name="player_mpv_video_output_gpu_next">GPU Next（上級）</string>
+    <string name="player_mpv_profile">MPVプロファイル</string>
+    <string name="player_mpv_profile_fast">Fast（推奨）</string>
+    <string name="player_mpv_profile_gpu_hq">GPU高画質（上級）</string>
+    <string name="player_mpv_scaler">MPVスケーラー</string>
+    <string name="player_mpv_scaler_bilinear">Bilinear（推奨）</string>
+    <string name="player_mpv_scaler_lanczos">Lanczos（上級）</string>
     <string name="player_show_debug_icon">&#x30D7;&#x30EC;&#x30FC;&#x30E4;&#x30FC;&#x306B;&#x30C7;&#x30D0;&#x30C3;&#x30B0;&#x30A2;&#x30A4;&#x30B3;&#x30F3;&#x3092;&#x8868;&#x793A;</string>
     <string name="player_show_debug_icon_description">&#x30D7;&#x30EC;&#x30FC;&#x30E4;&#x30FC;&#x64CD;&#x4F5C;&#x306B;&#x518D;&#x751F;&#x8A3A;&#x65AD;&#x3092;&#x8868;&#x793A;&#x3057;&#x307E;&#x3059;&#x3002;</string>
     <string name="autoplay_next_episode">次のエピソードを自動再生</string>
@@ -185,6 +198,7 @@
     <string name="player_fit">画面に合わせる</string>
     <string name="player_previous">前の項目</string>
     <string name="player_next">次の項目</string>
+    <string name="player_close">プレーヤーを閉じる</string>
     <string name="pause">一時停止</string>
     <string name="player_seek_back">10秒戻る</string>
     <string name="player_seek_forward">10秒進む</string>
