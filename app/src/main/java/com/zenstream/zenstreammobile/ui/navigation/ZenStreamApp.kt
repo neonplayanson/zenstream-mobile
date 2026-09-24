@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsIgnoringVisibility
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -59,6 +60,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -81,7 +83,10 @@ import com.zenstream.zenstreammobile.audio.AudioCommandResult
 import com.zenstream.zenstreammobile.audio.AudioPlayerCoordinator
 import com.zenstream.zenstreammobile.data.AppUpdate
 import com.zenstream.zenstreammobile.data.CatalogRepository
+import com.zenstream.zenstreammobile.data.NativeAppDeepLink
+import com.zenstream.zenstreammobile.data.NativeAppDestination
 import com.zenstream.zenstreammobile.data.SyncplayManager
+import com.zenstream.zenstreammobile.data.sameNativeAppServer
 import com.zenstream.zenstreammobile.launchPlayback
 import com.zenstream.zenstreammobile.model.AuthSession
 import com.zenstream.zenstreammobile.model.MediaItem
@@ -154,7 +159,7 @@ fun ZenStreamApp(
         appState.loading -> LoadingScreen()
         appState.showSetup ->
             ServerSetupScreen(
-                initialServerUrl = appState.orchestratorUrl,
+                initialServerUrl = appState.pendingDeepLink?.serverUrl ?: appState.orchestratorUrl,
                 onConfigured = appViewModel::configureServer,
             )
 
@@ -163,6 +168,8 @@ fun ZenStreamApp(
             MainScaffold(
                 repository = repository,
                 session = appState.session,
+                pendingDeepLink = appState.pendingDeepLink,
+                onNativeAppLinkConsumed = appViewModel::consumeNativeAppLink,
                 onLogout = appViewModel::logout,
                 onPasswordChanged = appViewModel::passwordChanged,
                 onPickAvatar = onPickAvatar,
@@ -179,6 +186,26 @@ fun ZenStreamApp(
             onOpenRelease = {
                 appViewModel.dismissAvailableUpdate()
                 openReleasePage(context, update.releaseUrl)
+            },
+        )
+    }
+
+    appState.serverSwitchRequest?.let { request ->
+        AlertDialog(
+            onDismissRequest = appViewModel::cancelNativeAppServerSwitch,
+            title = { Text(stringResource(R.string.native_app_switch_title)) },
+            text = {
+                Text(stringResource(R.string.native_app_switch_message, request.serverUrl))
+            },
+            confirmButton = {
+                TextButton(onClick = appViewModel::confirmNativeAppServerSwitch) {
+                    Text(stringResource(R.string.native_app_switch_confirm))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = appViewModel::cancelNativeAppServerSwitch) {
+                    Text(stringResource(R.string.cancel))
+                }
             },
         )
     }
@@ -222,11 +249,13 @@ private fun LoadingScreen() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun MainScaffold(
     repository: CatalogRepository,
     session: AuthSession,
+    pendingDeepLink: NativeAppDeepLink?,
+    onNativeAppLinkConsumed: () -> Unit,
     onLogout: () -> Unit,
     onPasswordChanged: () -> Unit,
     onPickAvatar: () -> Unit,
@@ -272,6 +301,14 @@ private fun MainScaffold(
         }
     }
     val navController = rememberNavController()
+    LaunchedEffect(pendingDeepLink, session.token) {
+        val link = pendingDeepLink ?: return@LaunchedEffect
+        if (!sameNativeAppServer(session.serverUrl, link.serverUrl)) {
+            return@LaunchedEffect
+        }
+        navigateToNativeAppLink(navController, link)
+        onNativeAppLinkConsumed()
+    }
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = routeName(backStackEntry?.destination?.route) ?: HOME
     val mainRoute =
@@ -356,6 +393,7 @@ private fun MainScaffold(
     var bottomBarVisibilityFraction by remember { mutableStateOf(1f) }
     var topBarVisibilityFraction by remember { mutableStateOf(1f) }
     var contentScrollable by remember { mutableStateOf(false) }
+    var bottomOverlayHeightPx by remember { mutableStateOf(0) }
     var myPageNavigationResetKey by remember { mutableStateOf(0) }
     var lastMainRoute by remember { mutableStateOf(mainRoute) }
     val onContentScrollabilityChanged: (Boolean) -> Unit = remember {
@@ -450,11 +488,26 @@ private fun MainScaffold(
             bottomBar = {},
             containerColor = MaterialTheme.colorScheme.background,
         ) { padding ->
+            val bottomOverlayContentPadding =
+                with(density) {
+                    bottomOverlayContentPaddingPx(
+                            overlayHeightPx = bottomOverlayHeightPx,
+                            systemNavigationBarInsetPx =
+                                WindowInsets.navigationBarsIgnoringVisibility.getBottom(this),
+                        )
+                        .toDp()
+                }
             Box(modifier = Modifier.fillMaxSize()) {
                 NavHost(
                     navController,
                     startDestination = HOME,
-                    modifier = Modifier.fillMaxSize().nestedScroll(scrollConnection),
+                    modifier =
+                        Modifier.fillMaxSize()
+                            // The player/navigation chrome is outside Scaffold's bottom slot.
+                            // Child screens already consume Scaffold's system-bar inset, so only
+                            // reserve the measured overlay body here.
+                            .padding(bottom = bottomOverlayContentPadding)
+                            .nestedScroll(scrollConnection),
                 ) {
                     composable(HOME) {
                         HomeScreen(
@@ -688,7 +741,12 @@ private fun MainScaffold(
                 ToastHost(state = toast)
             }
         }
-        Column(modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()) {
+        Column(
+            modifier =
+                Modifier.align(Alignment.BottomCenter).fillMaxWidth().onSizeChanged {
+                    bottomOverlayHeightPx = it.height
+                }
+        ) {
             AnimatedVisibility(
                 visible = audioState.currentEntry != null && currentRoute != NOW_PLAYING,
                 enter =
@@ -763,6 +821,23 @@ private fun queueAddedMessage(context: Context, trackCount: Int): String =
 private fun navigateToDetail(navController: androidx.navigation.NavHostController, itemId: String) {
     navController.navigate("detail/${Uri.encode(itemId)}") {
         launchSingleTop = true
+    }
+}
+
+private fun navigateToNativeAppLink(
+    navController: androidx.navigation.NavHostController,
+    link: NativeAppDeepLink,
+) {
+    when (val destination = link.destination) {
+        NativeAppDestination.Home -> navigateToMainDestination(navController, HOME)
+        NativeAppDestination.Library -> navigateToMainDestination(navController, LIBRARY)
+        NativeAppDestination.Favorites -> navigateToMainDestination(navController, FAVORITES)
+        NativeAppDestination.Notifications ->
+            navigateToMainDestination(navController, NOTIFICATIONS)
+        is NativeAppDestination.Album ->
+            navigateToAlbum(navController, destination.albumId, destination.trackId)
+        is NativeAppDestination.Artist -> navigateToArtist(navController, destination.artistId)
+        is NativeAppDestination.Detail -> navigateToDetail(navController, destination.itemId)
     }
 }
 
@@ -1096,3 +1171,8 @@ internal class ScrollVisibilityController(
 
 internal const val HIDE_DISTANCE_DP = 56f
 internal const val REVEAL_DISTANCE_DP = 64f
+
+internal fun bottomOverlayContentPaddingPx(
+    overlayHeightPx: Int,
+    systemNavigationBarInsetPx: Int,
+): Int = (overlayHeightPx - systemNavigationBarInsetPx).coerceAtLeast(0)

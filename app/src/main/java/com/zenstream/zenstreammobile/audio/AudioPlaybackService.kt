@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -21,12 +22,16 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CommandButton
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaLibraryService.LibraryParams
 import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
+import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
@@ -38,6 +43,7 @@ import com.zenstream.zenstreammobile.data.CatalogRepository
 import com.zenstream.zenstreammobile.data.SessionStore
 import com.zenstream.zenstreammobile.data.audioQueueScope
 import com.zenstream.zenstreammobile.data.audioQueueSnapshotFromJson
+import com.zenstream.zenstreammobile.data.playbackUrlWithAccess
 import com.zenstream.zenstreammobile.data.withPrimaryArtworkFallback
 import com.zenstream.zenstreammobile.model.AudioPlayerState
 import com.zenstream.zenstreammobile.model.AudioQueueEntry
@@ -90,6 +96,7 @@ class AudioPlaybackService : MediaLibraryService() {
     private var positionJob: Job? = null
     private var persistJob: Job? = null
     private var lyricsPrefetchJob: Job? = null
+    private var audioAccessRefreshJob: Job? = null
     private var autoAdoptionJob: Job? = null
     private var currentState = AudioPlayerState()
     private var retryEntryId: String? = null
@@ -106,6 +113,10 @@ class AudioPlaybackService : MediaLibraryService() {
     private var persistenceEpoch = 0L
     private var restoreValidationJob: Job? = null
     private var sessionDetached = false
+    private var mediaNotificationController: MediaSession.ControllerInfo? = null
+    private var lastNotificationEntryId: String? = null
+    private var lastNotificationFavorite: Boolean? = null
+    private var lastNotificationPlaying: Boolean? = null
     private val audioDiagnostics = AudioPlaybackDiagnostics { activeAudioSource }
 
     private fun cancelRecovery() {
@@ -127,6 +138,8 @@ class AudioPlaybackService : MediaLibraryService() {
                 positionMs = positionMs,
             )
         if (request != null) {
+            audioAccessRefreshJob?.cancel()
+            audioAccessRefreshJob = null
             if (sessionDetached) attachAudioSession()
             restoreValidationJob?.cancel()
             restoreValidationJob = null
@@ -196,6 +209,7 @@ class AudioPlaybackService : MediaLibraryService() {
         httpFactory = DefaultHttpDataSource.Factory().setAllowCrossProtocolRedirects(false)
         dataSourceFactory = DefaultDataSource.Factory(this, httpFactory)
         mediaSourceFactory = AudioMediaSourceFactory(dataSourceFactory)
+        setMediaNotificationProvider(AudioMediaNotificationProvider())
         player =
             ExoPlayer.Builder(this, preferredAudioRenderersFactory(this))
                 .setMediaSourceFactory(mediaSourceFactory)
@@ -270,7 +284,10 @@ class AudioPlaybackService : MediaLibraryService() {
                 AudioServiceBridge.ACTION_SEEK ->
                     seekTo(intent.getLongExtra(AudioServiceBridge.EXTRA_POSITION, 0L))
                 AudioServiceBridge.ACTION_REMOVE_QUEUE ->
-                    removeQueue(intent.getStringExtra(AudioServiceBridge.EXTRA_ENTRY_ID))
+                    removeQueue(
+                        intent.getStringExtra(AudioServiceBridge.EXTRA_ENTRY_ID),
+                        commandSequence,
+                    )
                 AudioServiceBridge.ACTION_REORDER_QUEUE ->
                     reorderQueue(
                         intent.getIntExtra(AudioServiceBridge.EXTRA_FROM, -1),
@@ -343,7 +360,7 @@ class AudioPlaybackService : MediaLibraryService() {
                 currentState = AudioPlayerState()
                 rememberPosition(null, 0L)
                 playerScope = scope
-                AudioServiceBridge.publish(currentState)
+                publishAudioState()
                 true
             }
         }
@@ -362,7 +379,7 @@ class AudioPlaybackService : MediaLibraryService() {
                         currentState.currentEntry?.entryId,
                         currentState.positionSeconds.coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L,
                     )
-                    AudioServiceBridge.publish(currentState)
+                    publishAudioState()
                     restoredGeneration = checkNotNull(restoreGeneration)
                 }
             }
@@ -416,23 +433,21 @@ class AudioPlaybackService : MediaLibraryService() {
                         currentIndex = validated.currentIndex,
                         playedEntryIds = validated.playedEntryIds,
                     )
-                AudioServiceBridge.publish(currentState)
+                publishAudioState()
                 persistSnapshot()
             }
         }
     }
 
     private suspend fun restoreAudioPreferences() {
-        val shuffle =
-            currentState.queue.takeIf { it.isNotEmpty() }?.let { currentState.shuffle }
-                ?: sessionStore.audioShuffle.first()
-        val repeatMode =
-            currentState.queue.takeIf { it.isNotEmpty() }?.let { currentState.repeatMode }
-                ?: sessionStore.audioRepeatMode.first()
         // Android's media stream volume is the only volume authority. Ignore
         // legacy app-local gain/mute values so an old saved mute cannot silence
         // playback after the in-app volume control has been removed.
         queueCommandMutex.withLock {
+            // Queue snapshots can lag a just-toggled setting. The dedicated device-local
+            // preferences remain authoritative even when a queue is restored.
+            val shuffle = sessionStore.audioShuffle.first()
+            val repeatMode = sessionStore.audioRepeatMode.first()
             player.volume = 1f
             currentState =
                 currentState.copy(
@@ -441,7 +456,7 @@ class AudioPlaybackService : MediaLibraryService() {
                     shuffle = shuffle,
                     repeatMode = repeatMode,
                 )
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
     }
 
@@ -489,6 +504,9 @@ class AudioPlaybackService : MediaLibraryService() {
 
     private suspend fun replaceQueue(encoded: String, commandSequence: Long) {
         val snapshot = parseSnapshot(encoded) ?: return
+        // The first explicit play can arrive before the coordinator's startup restore finishes.
+        // Load saved player modes before applying a newly-created queue snapshot with defaults.
+        ensureRestored(commandSequence)
         val account = sessionStore.session.first() ?: return
         if (!snapshotBelongsTo(snapshot, account)) return
         val entryId = snapshot.entries.getOrNull(snapshot.currentIndex)?.entryId ?: return
@@ -506,11 +524,17 @@ class AudioPlaybackService : MediaLibraryService() {
             sessionDetached = false
             playerScope = accountScope(account)
             loadingCurrent = true
+            // A normal Play/track selection carries default values in its queue snapshot. Keep
+            // the device-local modes already active in the service; an explicit Shuffle action
+            // can turn shuffle on for the new queue.
+            val shuffle = snapshot.shuffle || currentState.shuffle
+            val repeatMode = currentState.repeatMode
             // PLAY_QUEUE is an explicit user selection, not queue restoration. Never carry a
             // position from the previously playing item (or from a stale caller snapshot) into
             // the newly selected track.
             currentState =
                 snapshot
+                    .copy(shuffle = shuffle, repeatMode = repeatMode)
                     .toPlayerState()
                     .copy(
                         positionSeconds = 0L,
@@ -532,11 +556,11 @@ class AudioPlaybackService : MediaLibraryService() {
                 AUDIO_TAG,
                 "audio selection accepted generation=${accepted.generation} sequence=$commandSequence entry=$entryId",
             )
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
+            sessionStore.saveAudioShuffle(shuffle)
+            sessionStore.saveAudioRepeatMode(repeatMode)
         }
         val accepted = request ?: return
-        sessionStore.saveAudioShuffle(snapshot.shuffle)
-        sessionStore.saveAudioRepeatMode(snapshot.repeatMode)
         persistSnapshot()
         launchLoad(accepted)
     }
@@ -577,7 +601,7 @@ class AudioPlaybackService : MediaLibraryService() {
                 currentState.currentEntry?.entryId,
                 currentState.positionSeconds.coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L,
             )
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
     }
 
@@ -619,7 +643,7 @@ class AudioPlaybackService : MediaLibraryService() {
                     player.clearMediaItems()
                     currentState =
                         currentState.copy(isLoading = true, error = null, isPlaying = false)
-                    AudioServiceBridge.publish(currentState)
+                    publishAudioState()
                 } else {
                     player.play()
                     publishPlayerState()
@@ -651,7 +675,7 @@ class AudioPlaybackService : MediaLibraryService() {
             player.stop()
             player.clearMediaItems()
             currentState = currentState.copy(isLoading = true, error = null, isPlaying = false)
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
         request?.let(::launchLoad)
     }
@@ -694,7 +718,7 @@ class AudioPlaybackService : MediaLibraryService() {
                             isLoading = false,
                             error = "Sign in to play music",
                         )
-                    AudioServiceBridge.publish(currentState)
+                    publishAudioState()
                 }
             }
             return
@@ -712,7 +736,7 @@ class AudioPlaybackService : MediaLibraryService() {
                     error = null,
                     positionUpdatedAtElapsedRealtime = 0L,
                 )
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
         if (!transactionController.isCurrent(request, currentState.currentEntry?.entryId)) return
 
@@ -831,7 +855,7 @@ class AudioPlaybackService : MediaLibraryService() {
                     AUDIO_TAG,
                     "audio player play generation=${request.generation} entry=${request.entryId} loading=$loadingCurrent",
                 )
-                AudioServiceBridge.publish(currentState)
+                publishAudioState()
             }
             if (
                 !mediaApplied ||
@@ -843,12 +867,15 @@ class AudioPlaybackService : MediaLibraryService() {
             prefetchLyrics(account, entry)
             // Telemetry is deliberately after player.play(). It cannot delay or fail playback.
             if (request.autoPlay) launchPlayStart(account, entry, request.generation)
+            startAudioAccessRefresh(account, entry, request, data)
         } catch (error: Throwable) {
             if (error is kotlinx.coroutines.CancellationException) throw error
             if (!transactionController.isCurrent(request, currentState.currentEntry?.entryId))
                 return
             if ((error as? CatalogException)?.statusCode == 401)
                 repository.clearSessionIfCurrent(account)
+            audioAccessRefreshJob?.cancel()
+            audioAccessRefreshJob = null
             queueCommandMutex.withLock {
                 if (!transactionController.isCurrent(request, currentState.currentEntry?.entryId)) {
                     return@withLock
@@ -863,7 +890,89 @@ class AudioPlaybackService : MediaLibraryService() {
                     )
                 player.pause()
                 player.clearMediaItems()
-                AudioServiceBridge.publish(currentState)
+                publishAudioState()
+            }
+        }
+    }
+
+    private fun startAudioAccessRefresh(
+        account: AuthSession,
+        entry: AudioQueueEntry,
+        request: PlaybackRequest,
+        data: com.zenstream.zenstreammobile.model.PlaybackData,
+    ) {
+        audioAccessRefreshJob?.cancel()
+        val sourceId = data.source.id ?: return
+        var expiresInSeconds = data.accessExpiresIn ?: return
+        audioAccessRefreshJob = serviceScope.launch {
+            while (true) {
+                delay((expiresInSeconds * 1_000L - 60_000L).coerceAtLeast(30_000L))
+                if (!transactionController.isCurrent(request, currentState.currentEntry?.entryId)) {
+                    return@launch
+                }
+                val refreshed =
+                    try {
+                        repository.refreshPlaybackAccess(
+                            account,
+                            entry.track.id,
+                            sourceId,
+                            data.sessionId,
+                        )
+                    } catch (error: kotlinx.coroutines.CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        Log.w(
+                            AUDIO_TAG,
+                            "audio access refresh failed entry=${entry.entryId} error=${error.message}",
+                        )
+                        delay(30_000L)
+                        continue
+                    }
+                val positionMs = observedPlayerPositionMs()
+                val shouldPlay = player.isPlaying
+                val nextUrl =
+                    playbackUrlWithAccess(
+                        account,
+                        entry.track.id,
+                        data.source,
+                        refreshed.ticket,
+                    )
+                val nextSource =
+                    normalizeAudioSource(
+                        url = nextUrl,
+                        mimeType = data.mimeType,
+                        mode = data.mode,
+                        sessionId = data.sessionId,
+                        durationSeconds = data.durationSeconds ?: data.source.durationSeconds,
+                        expiresAt = data.expiresAt,
+                    )
+                queueCommandMutex.withLock {
+                    if (
+                        !transactionController.isCurrent(
+                            request,
+                            currentState.currentEntry?.entryId,
+                        )
+                    ) {
+                        return@withLock
+                    }
+                    activeAudioSource = nextSource
+                    player.setMediaSource(
+                        mediaSourceFactory.createMediaSource(
+                            MediaItem.Builder()
+                                .setMediaId("zenstream:queue:${entry.entryId}")
+                                .setUri(Uri.parse(nextUrl))
+                                .apply { nextSource.mimeType?.let(::setMimeType) }
+                                .setMediaMetadata(
+                                    player.currentMediaItem?.mediaMetadata ?: MediaMetadata.EMPTY
+                                )
+                                .build()
+                        )
+                    )
+                    player.prepare()
+                    player.seekTo(positionMs)
+                    if (shouldPlay) player.play() else player.pause()
+                }
+                expiresInSeconds = refreshed.expiresInSeconds
             }
         }
     }
@@ -987,7 +1096,7 @@ class AudioPlaybackService : MediaLibraryService() {
                     player.clearMediaItems()
                     currentState =
                         currentState.copy(isLoading = true, isPlaying = false, error = null)
-                    AudioServiceBridge.publish(currentState)
+                    publishAudioState()
                 } else {
                     player.play()
                     publishPlayerState()
@@ -1028,7 +1137,7 @@ class AudioPlaybackService : MediaLibraryService() {
             player.clearMediaItems()
             retryEntryId = null
             lastAutoplay = true
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
             shouldPersist = true
         }
         progress?.let(::enqueueProgress)
@@ -1091,7 +1200,7 @@ class AudioPlaybackService : MediaLibraryService() {
             player.clearMediaItems()
             lastAutoplay = true
             retryEntryId = null
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
             shouldPersist = true
         }
         progress?.let(::enqueueProgress)
@@ -1149,7 +1258,7 @@ class AudioPlaybackService : MediaLibraryService() {
             player.clearMediaItems()
             retryEntryId = null
             lastAutoplay = true
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
             shouldPersist = true
         }
         progress?.let(::enqueueProgress)
@@ -1165,8 +1274,8 @@ class AudioPlaybackService : MediaLibraryService() {
                 if (value) shuffleQueueKeepingCurrent(currentState)
                 else currentState.copy(shuffle = false)
             publishPlayerState()
+            sessionStore.saveAudioShuffle(value)
         }
-        sessionStore.saveAudioShuffle(value)
         persistSnapshot()
     }
 
@@ -1176,8 +1285,8 @@ class AudioPlaybackService : MediaLibraryService() {
             value = currentState.repeatMode.next()
             currentState = currentState.copy(repeatMode = value)
             publishPlayerState()
+            sessionStore.saveAudioRepeatMode(value)
         }
-        sessionStore.saveAudioRepeatMode(value)
         persistSnapshot()
     }
 
@@ -1212,7 +1321,7 @@ class AudioPlaybackService : MediaLibraryService() {
         persistSnapshot()
     }
 
-    private suspend fun removeQueue(entryId: String?) {
+    private suspend fun removeQueue(entryId: String?, commandSequence: Long) {
         if (entryId.isNullOrBlank()) return
         var request: PlaybackRequest? = null
         var progress: ProgressSample? = null
@@ -1268,7 +1377,7 @@ class AudioPlaybackService : MediaLibraryService() {
             shouldPersist = true
         }
         if (shouldClear) {
-            clearQueue(commandSequence = 0L)
+            clearQueue(commandSequence)
             return
         }
         progress?.let(::enqueueProgress)
@@ -1289,12 +1398,16 @@ class AudioPlaybackService : MediaLibraryService() {
         val account = sessionStore.session.first()
         var progress: ProgressSample? = null
         var applied = false
+        var teardownGeneration = 0L
         queueCommandMutex.withLock {
             if (!transactionController.invalidate(commandSequence)) return@withLock
             applied = true
+            teardownGeneration = transactionController.currentGeneration()
             persistenceEpoch += 1L
             persistJob?.cancel()
             restoreValidationJob?.cancel()
+            audioAccessRefreshJob?.cancel()
+            audioAccessRefreshJob = null
             progress = captureProgressSample(paused = true)
             suppressEnded = true
             loadingCurrent = false
@@ -1305,7 +1418,7 @@ class AudioPlaybackService : MediaLibraryService() {
             retryEntryId = null
             rememberPosition(null, 0L)
             currentState = AudioPlayerState()
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
         if (!applied) return
         Log.i(AUDIO_TAG, "audio stop applied queue=empty")
@@ -1316,8 +1429,7 @@ class AudioPlaybackService : MediaLibraryService() {
         lyricsPrefetchJob = null
         autoAdoptionJob?.cancel()
         autoAdoptionJob = null
-        detachAudioSessionAndStopService()
-        stopSelf()
+        if (!detachAudioSessionIfCurrent(commandSequence, teardownGeneration)) return
     }
 
     private suspend fun pauseForVideoAndDetach(commandId: String?, commandSequence: Long) {
@@ -1325,9 +1437,11 @@ class AudioPlaybackService : MediaLibraryService() {
         val account = sessionStore.session.first()
         var progress: ProgressSample? = null
         var applied = false
+        var teardownGeneration = 0L
         queueCommandMutex.withLock {
             if (!transactionController.invalidate(commandSequence)) return@withLock
             applied = true
+            teardownGeneration = transactionController.currentGeneration()
             persistenceEpoch += 1L
             persistJob?.cancel()
             progress = captureProgressSample(paused = true)
@@ -1348,11 +1462,13 @@ class AudioPlaybackService : MediaLibraryService() {
             lyricsPrefetchJob = null
             autoAdoptionJob?.cancel()
             autoAdoptionJob = null
+            audioAccessRefreshJob?.cancel()
+            audioAccessRefreshJob = null
             player.pause()
             player.stop()
             player.clearMediaItems()
             currentState = currentState.copy(isPlaying = false, isLoading = false)
-            AudioServiceBridge.publish(currentState)
+            publishAudioState()
         }
         if (!applied) {
             AudioServiceBridge.complete(
@@ -1363,19 +1479,164 @@ class AudioPlaybackService : MediaLibraryService() {
         }
         if (account != null) persistSnapshotNow(account)
         progress?.let(::enqueueProgress)
-        detachAudioSessionAndStopService()
+        if (!detachAudioSessionIfCurrent(commandSequence, teardownGeneration)) {
+            AudioServiceBridge.complete(
+                commandId,
+                AudioCommandResult.Failed("A newer audio command is already active"),
+            )
+            return
+        }
         AudioServiceBridge.complete(commandId, AudioCommandResult.Applied)
         Log.i(AUDIO_TAG, "audio video handoff acknowledged")
+    }
+
+    private suspend fun detachAudioSessionIfCurrent(
+        commandSequence: Long,
+        teardownGeneration: Long,
+    ): Boolean = queueCommandMutex.withLock {
+        if (!transactionController.canFinalizeTeardown(commandSequence, teardownGeneration)) {
+            Log.i(
+                AUDIO_TAG,
+                "audio session teardown skipped sequence=$commandSequence generation=$teardownGeneration",
+            )
+            return@withLock false
+        }
+        detachAudioSessionAndStopService()
         stopSelf()
+        true
     }
 
     private fun detachAudioSessionAndStopService() {
         if (sessionDetached) return
         sessionDetached = true
+        mediaNotificationController = null
+        lastNotificationEntryId = null
+        lastNotificationFavorite = null
+        lastNotificationPlaying = null
         librarySession?.release()
         librarySession = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         Log.i(AUDIO_TAG, "audio session detached foreground removed")
+    }
+
+    private fun notificationButtonPreferences(
+        showPauseButton: Boolean = player.isPlaying
+    ): ImmutableList<CommandButton> {
+        val heart = AudioNotificationControl.Heart
+        val previous = AudioNotificationControl.Previous
+        val playPause = AudioNotificationControl.PlayPause
+        val next = AudioNotificationControl.Next
+        val stop = AudioNotificationControl.Stop
+        val favorite = currentState.currentEntry?.track?.favorite == true
+
+        fun customCommand(action: String): SessionCommand = SessionCommand(action, Bundle.EMPTY)
+
+        fun compactExtras(control: AudioNotificationControl): Bundle =
+            Bundle().apply {
+                AudioNotificationControls.compactIndexFor(control)?.let { index ->
+                    putInt(DefaultMediaNotificationProvider.COMMAND_KEY_COMPACT_VIEW_INDEX, index)
+                }
+            }
+
+        val buttons =
+            mapOf(
+                heart to
+                    CommandButton.Builder(AudioNotificationControls.heartIcon(favorite))
+                        .setSessionCommand(
+                            customCommand(AudioNotificationControls.ACTION_TOGGLE_FAVORITE)
+                        )
+                        .setDisplayName(
+                            getString(
+                                if (favorite) R.string.remove_favorite else R.string.add_favorite
+                            )
+                        )
+                        .setSlots(AudioNotificationControls.slotFor(heart))
+                        .setExtras(compactExtras(heart))
+                        .build(),
+                previous to
+                    CommandButton.Builder(CommandButton.ICON_PREVIOUS)
+                        .setSessionCommand(customCommand(AudioNotificationControls.ACTION_PREVIOUS))
+                        .setDisplayName(getString(R.string.audio_previous_track))
+                        .setSlots(AudioNotificationControls.slotFor(previous))
+                        .setExtras(compactExtras(previous))
+                        .build(),
+                playPause to
+                    CommandButton.Builder(
+                            if (showPauseButton) CommandButton.ICON_PAUSE
+                            else CommandButton.ICON_PLAY
+                        )
+                        .setPlayerCommand(Player.COMMAND_PLAY_PAUSE)
+                        .setDisplayName(
+                            getString(if (showPauseButton) R.string.pause else R.string.play)
+                        )
+                        .setSlots(AudioNotificationControls.slotFor(playPause))
+                        .setExtras(compactExtras(playPause))
+                        .build(),
+                next to
+                    CommandButton.Builder(CommandButton.ICON_NEXT)
+                        .setSessionCommand(customCommand(AudioNotificationControls.ACTION_NEXT))
+                        .setDisplayName(getString(R.string.audio_next_track))
+                        .setSlots(AudioNotificationControls.slotFor(next))
+                        .setExtras(compactExtras(next))
+                        .build(),
+                stop to
+                    CommandButton.Builder(CommandButton.ICON_STOP)
+                        .setSessionCommand(customCommand(AudioNotificationControls.ACTION_STOP))
+                        .setDisplayName(getString(R.string.stop_playing))
+                        .setSlots(AudioNotificationControls.slotFor(stop))
+                        .setExtras(compactExtras(stop))
+                        .build(),
+            )
+
+        return ImmutableList.copyOf(
+            AudioNotificationControls.expandedOrder.map { control ->
+                checkNotNull(buttons[control])
+            }
+        )
+    }
+
+    private fun refreshNotificationControls(force: Boolean = false) {
+        val session = librarySession ?: return
+        val entryId = currentState.currentEntry?.entryId
+        val favorite = currentState.currentEntry?.track?.favorite == true
+        val isPlaying = player.isPlaying
+        if (
+            !force &&
+                entryId == lastNotificationEntryId &&
+                favorite == lastNotificationFavorite &&
+                isPlaying == lastNotificationPlaying
+        ) {
+            return
+        }
+        lastNotificationEntryId = entryId
+        lastNotificationFavorite = favorite
+        lastNotificationPlaying = isPlaying
+        mediaNotificationController?.let { controller ->
+            session.setMediaButtonPreferences(controller, notificationButtonPreferences(isPlaying))
+        }
+    }
+
+    private inner class AudioMediaNotificationProvider :
+        DefaultMediaNotificationProvider(
+            this@AudioPlaybackService,
+            object : DefaultMediaNotificationProvider.NotificationIdProvider {
+                override fun getNotificationId(mediaSession: MediaSession): Int =
+                    AudioNotificationConfig.NOTIFICATION_ID
+            },
+            AudioNotificationConfig.CHANNEL_ID,
+            R.string.app_name,
+        ) {
+        init {
+            setSmallIcon(R.drawable.ic_launcher_foreground)
+        }
+
+        @Suppress("UNUSED_PARAMETER")
+        override fun getMediaButtons(
+            session: MediaSession,
+            playerCommands: Player.Commands,
+            mediaButtonPreferences: ImmutableList<CommandButton>,
+            showPauseButton: Boolean,
+        ): ImmutableList<CommandButton> = notificationButtonPreferences(showPauseButton)
     }
 
     private fun attachAudioSession() {
@@ -1388,11 +1649,15 @@ class AudioPlaybackService : MediaLibraryService() {
                 Intent(this, MainActivity::class.java),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
-        librarySession =
+        val session =
             MediaLibrarySession.Builder(this, player, LibraryCallback())
                 .setSessionActivity(sessionActivity)
+                .setMediaButtonPreferences(notificationButtonPreferences())
                 .build()
+        librarySession = session
         sessionDetached = false
+        addSession(session)
+        refreshNotificationControls(force = true)
     }
 
     private suspend fun updateFavorite(itemId: String?, favorite: Boolean) {
@@ -1411,6 +1676,24 @@ class AudioPlaybackService : MediaLibraryService() {
             changed = true
         }
         if (changed) persistSnapshot()
+    }
+
+    private suspend fun toggleFavoriteFromNotification(): Boolean {
+        val account = sessionStore.session.first() ?: return false
+        val entry = queueCommandMutex.withLock { currentState.currentEntry } ?: return false
+        val favorite = !entry.track.favorite
+        updateFavorite(entry.track.id, favorite)
+        return try {
+            repository.setFavorite(account, entry.track.id, favorite)
+            true
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            updateFavorite(entry.track.id, !favorite)
+            throw error
+        } catch (error: Throwable) {
+            Log.w(AUDIO_TAG, "notification favorite update failed", error)
+            updateFavorite(entry.track.id, !favorite)
+            false
+        }
     }
 
     private data class ProgressSample(
@@ -1504,6 +1787,11 @@ class AudioPlaybackService : MediaLibraryService() {
         }
     }
 
+    private fun publishAudioState() {
+        AudioServiceBridge.publish(currentState)
+        refreshNotificationControls()
+    }
+
     private fun publishPlayerState() {
         val duration =
             player.duration
@@ -1520,7 +1808,7 @@ class AudioPlaybackService : MediaLibraryService() {
                 isPlaying = player.isPlaying,
                 isLoading = loadingCurrent,
             )
-        AudioServiceBridge.publish(currentState)
+        publishAudioState()
     }
 
     private val playerListener =
@@ -1631,7 +1919,7 @@ class AudioPlaybackService : MediaLibraryService() {
                                         isPlaying = false,
                                         error = null,
                                     )
-                                AudioServiceBridge.publish(currentState)
+                                publishAudioState()
                             }
                             launchLoad(request)
                         } finally {
@@ -1650,7 +1938,7 @@ class AudioPlaybackService : MediaLibraryService() {
                             isLoading = false,
                             error = error.message ?: "Audio decoder error",
                         )
-                    AudioServiceBridge.publish(currentState)
+                    publishAudioState()
                 }
             }
         }
@@ -1898,6 +2186,7 @@ class AudioPlaybackService : MediaLibraryService() {
         }
         positionJob?.cancel()
         progressJob?.cancel()
+        audioAccessRefreshJob?.cancel()
         lyricsPrefetchJob?.cancel()
         autoAdoptionJob?.cancel()
         cancelRecovery()
@@ -1924,7 +2213,7 @@ class AudioPlaybackService : MediaLibraryService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             notificationManager.createNotificationChannel(
                 NotificationChannel(
-                        AUDIO_NOTIFICATION_CHANNEL,
+                        AudioNotificationConfig.CHANNEL_ID,
                         getString(R.string.app_name),
                         NotificationManager.IMPORTANCE_LOW,
                     )
@@ -1942,7 +2231,7 @@ class AudioPlaybackService : MediaLibraryService() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
         val notification =
-            NotificationCompat.Builder(this, AUDIO_NOTIFICATION_CHANNEL)
+            NotificationCompat.Builder(this, AudioNotificationConfig.CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
                 .setContentTitle(getString(R.string.app_name))
                 .setContentText("Audio player ready")
@@ -1954,13 +2243,127 @@ class AudioPlaybackService : MediaLibraryService() {
                 .build()
         ServiceCompat.startForeground(
             this,
-            AUDIO_NOTIFICATION_ID,
+            AudioNotificationConfig.NOTIFICATION_ID,
             notification,
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
         )
     }
 
     private inner class LibraryCallback : MediaLibrarySession.Callback {
+        override fun onConnectAsync(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.ConnectionResult> {
+            val result = SettableFuture.create<MediaSession.ConnectionResult>()
+            val accepted = MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller)
+            if (session.isMediaNotificationController(controller)) {
+                val availableSessionCommands =
+                    (if (controller.isTrusted)
+                            MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
+                        else
+                            MediaSession.ConnectionResult
+                                .DEFAULT_UNTRUSTED_SESSION_AND_LIBRARY_COMMANDS)
+                        .buildUpon()
+                        .add(
+                            SessionCommand(
+                                AudioNotificationControls.ACTION_TOGGLE_FAVORITE,
+                                Bundle.EMPTY,
+                            )
+                        )
+                        .add(
+                            SessionCommand(
+                                AudioNotificationControls.ACTION_PREVIOUS,
+                                Bundle.EMPTY,
+                            )
+                        )
+                        .add(
+                            SessionCommand(
+                                AudioNotificationControls.ACTION_NEXT,
+                                Bundle.EMPTY,
+                            )
+                        )
+                        .add(
+                            SessionCommand(
+                                AudioNotificationControls.ACTION_STOP,
+                                Bundle.EMPTY,
+                            )
+                        )
+                        .build()
+                accepted
+                    .setAvailableSessionCommands(availableSessionCommands)
+                    .setMediaButtonPreferences(notificationButtonPreferences())
+            }
+            result.set(accepted.build())
+            return result
+        }
+
+        override fun onPostConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ) {
+            if (session.isMediaNotificationController(controller)) {
+                mediaNotificationController = controller
+                session.setMediaButtonPreferences(controller, notificationButtonPreferences())
+                refreshNotificationControls(force = true)
+            }
+        }
+
+        override fun onDisconnected(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ) {
+            if (mediaNotificationController === controller) {
+                mediaNotificationController = null
+                lastNotificationEntryId = null
+                lastNotificationFavorite = null
+                lastNotificationPlaying = null
+            }
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            if (AudioNotificationControls.controlForAction(customCommand.customAction) == null) {
+                return super.onCustomCommand(session, controller, customCommand, args)
+            }
+
+            val result = SettableFuture.create<SessionResult>()
+            serviceScope.launch {
+                try {
+                    val resultCode =
+                        when (customCommand.customAction) {
+                            AudioNotificationControls.ACTION_TOGGLE_FAVORITE ->
+                                if (toggleFavoriteFromNotification()) SessionResult.RESULT_SUCCESS
+                                else SessionResult.RESULT_ERROR_UNKNOWN
+                            AudioNotificationControls.ACTION_PREVIOUS -> {
+                                previous(commandSequence = 0L)
+                                SessionResult.RESULT_SUCCESS
+                            }
+                            AudioNotificationControls.ACTION_NEXT -> {
+                                advance(force = false, commandSequence = 0L)
+                                SessionResult.RESULT_SUCCESS
+                            }
+                            AudioNotificationControls.ACTION_STOP -> {
+                                clearQueue(commandSequence = 0L)
+                                SessionResult.RESULT_SUCCESS
+                            }
+                            else -> SessionResult.RESULT_ERROR_NOT_SUPPORTED
+                        }
+                    result.set(SessionResult(resultCode))
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    result.setException(error)
+                    throw error
+                } catch (error: Throwable) {
+                    Log.w(AUDIO_TAG, "notification command failed", error)
+                    result.set(SessionResult(SessionError.ERROR_UNKNOWN))
+                }
+            }
+            return result
+        }
+
         override fun onPlayerCommandRequest(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
@@ -1977,6 +2380,10 @@ class AudioPlaybackService : MediaLibraryService() {
                 }
                 Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
                     serviceScope.launch { previous(commandSequence = 0L) }
+                    Player.COMMAND_INVALID
+                }
+                Player.COMMAND_STOP -> {
+                    serviceScope.launch { clearQueue(commandSequence = 0L) }
                     Player.COMMAND_INVALID
                 }
                 else -> super.onPlayerCommandRequest(session, controller, playerCommand)
@@ -2344,8 +2751,6 @@ class AudioPlaybackService : MediaLibraryService() {
         private const val AUTO_PAGE_SIZE = 100
         private const val AUTO_MAX_ALBUMS = 1_000
         private const val AUTO_ARTIST_LIMIT = 100
-        private const val AUDIO_NOTIFICATION_CHANNEL = "audio_playback"
-        private const val AUDIO_NOTIFICATION_ID = 21_847
 
         private fun primaryArtist(item: CatalogMediaItem): String =
             item.artistCredits.firstOrNull()?.name
