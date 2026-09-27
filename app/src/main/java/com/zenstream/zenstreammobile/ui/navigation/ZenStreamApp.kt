@@ -3,10 +3,13 @@
 package com.zenstream.zenstreammobile.ui.navigation
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -64,6 +67,7 @@ import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -101,6 +105,7 @@ import com.zenstream.zenstreammobile.ui.components.SyncplayToastNotifications
 import com.zenstream.zenstreammobile.ui.components.ToastHost
 import com.zenstream.zenstreammobile.ui.components.UserAvatar
 import com.zenstream.zenstreammobile.ui.components.rememberToastHostState
+import com.zenstream.zenstreammobile.ui.detailShareUrl
 import com.zenstream.zenstreammobile.ui.screens.AudioMiniPlayer
 import com.zenstream.zenstreammobile.ui.screens.DetailScreen
 import com.zenstream.zenstreammobile.ui.screens.FavoritesScreen
@@ -118,6 +123,7 @@ import com.zenstream.zenstreammobile.ui.screens.SearchOverlayScreen
 import com.zenstream.zenstreammobile.ui.screens.ServerSetupScreen
 import com.zenstream.zenstreammobile.ui.screens.SyncplayGroupMenu
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 private const val HOME = "home"
@@ -283,6 +289,44 @@ private fun MainScaffold(
     val queueSnackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val videoHandoffError = stringResource(R.string.audio_video_handoff_failed)
+    val linkCopiedMessage = stringResource(R.string.link_copied)
+    val copyLinkFailedMessage = stringResource(R.string.copy_link_failed)
+    val copyShareLinkLabel = stringResource(R.string.copy_share_link)
+    val shareLinkUnavailableMessage = stringResource(R.string.share_link_unavailable)
+    val copyShareLink: (String) -> Unit = { path ->
+        scope.launch {
+            val publicWebUrl =
+                try {
+                    repository.fetchPublicWebUrl(session)
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    queueSnackbarHostState.showSnackbar(copyLinkFailedMessage)
+                    return@launch
+                }
+            val shareUrl = detailShareUrl(publicWebUrl, path)
+            if (shareUrl == null) {
+                queueSnackbarHostState.showSnackbar(shareLinkUnavailableMessage)
+                return@launch
+            }
+            try {
+                val clipboard =
+                    context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        ?: error("Clipboard service is unavailable")
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText(
+                        copyShareLinkLabel,
+                        shareUrl,
+                    )
+                )
+                queueSnackbarHostState.showSnackbar(linkCopiedMessage)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                queueSnackbarHostState.showSnackbar(copyLinkFailedMessage)
+            }
+        }
+    }
     val onAudioFavorite: (MediaItem) -> Unit = { item ->
         val favorite = !item.favorite
         audio.updateFavorite(item.id, favorite)
@@ -396,6 +440,7 @@ private fun MainScaffold(
     var bottomBarVisibilityFraction by remember { mutableStateOf(1f) }
     var topBarVisibilityFraction by remember { mutableStateOf(1f) }
     var contentScrollable by remember { mutableStateOf(false) }
+    var homeScrolled by remember { mutableStateOf(false) }
     var bottomOverlayHeightPx by remember { mutableStateOf(0) }
     var myPageNavigationResetKey by remember { mutableStateOf(0) }
     var lastMainRoute by remember { mutableStateOf(mainRoute) }
@@ -455,13 +500,11 @@ private fun MainScaffold(
         androidx.compose.material3.Scaffold(
             topBar = {
                 if (!topBarHidden) {
-                    StatusBarAwareTopBarSlot(
-                        visibilityFraction = topBarVisibilityFraction,
-                        modifier =
-                            Modifier.fillMaxWidth()
-                                .background(MaterialTheme.colorScheme.background),
-                    ) {
+                    val topBarContent: @Composable () -> Unit = {
                         MainTopBar(
+                            containerColor =
+                                if (mainRoute == HOME) Color.Transparent
+                                else MaterialTheme.colorScheme.background,
                             windowInsets = WindowInsets(0, 0, 0, 0),
                             syncplay = syncplay,
                             session = session,
@@ -485,6 +528,22 @@ private fun MainScaffold(
                                     }
                                 }
                             },
+                        )
+                    }
+                    if (mainRoute == HOME) {
+                        HomeTopBarSlot(
+                            scrolled = homeScrolled,
+                            visibilityFraction = topBarVisibilityFraction,
+                            modifier = Modifier.fillMaxWidth(),
+                            content = topBarContent,
+                        )
+                    } else {
+                        StatusBarAwareTopBarSlot(
+                            visibilityFraction = topBarVisibilityFraction,
+                            modifier =
+                                Modifier.fillMaxWidth()
+                                    .background(MaterialTheme.colorScheme.background),
+                            content = topBarContent,
                         )
                     }
                 }
@@ -513,6 +572,7 @@ private fun MainScaffold(
                                 bottomContentPadding = bottomOverlayHeight + 20.dp,
                                 onItemClick = { item -> navigateToMedia(navController, item) },
                                 onScrollabilityChanged = onContentScrollabilityChanged,
+                                onHomeScrolledChanged = { homeScrolled = it },
                             )
                         }
                         dialog(
@@ -682,6 +742,7 @@ private fun MainScaffold(
                                     }
                                 },
                                 onScrollabilityChanged = onContentScrollabilityChanged,
+                                onCopyShareLink = copyShareLink,
                             )
                         }
                         composable(
@@ -721,6 +782,7 @@ private fun MainScaffold(
                                 },
                                 onShuffleTracks = { tracks -> audio.playTracks(tracks, 0, true) },
                                 onScrollabilityChanged = onContentScrollabilityChanged,
+                                onCopyShareLink = copyShareLink,
                             )
                         }
                         composable(NOW_PLAYING) {
@@ -778,6 +840,7 @@ private fun MainScaffold(
                                         }
                                     }
                                 },
+                                onCopyShareLink = copyShareLink,
                             )
                         }
                     }
@@ -976,6 +1039,7 @@ internal fun MainTopBar(
     unreadCount: Int = 0,
     onNotifications: () -> Unit = {},
     windowInsets: WindowInsets = TopAppBarDefaults.windowInsets,
+    containerColor: Color = MaterialTheme.colorScheme.background,
 ) {
     TopAppBar(
         title = {
@@ -1029,9 +1093,35 @@ internal fun MainTopBar(
         },
         colors =
             TopAppBarDefaults.topAppBarColors(
-                containerColor = MaterialTheme.colorScheme.background
+                containerColor = containerColor,
+                scrolledContainerColor = containerColor,
             ),
         windowInsets = windowInsets,
+    )
+}
+
+@Composable
+@OptIn(ExperimentalLayoutApi::class)
+internal fun HomeTopBarSlot(
+    scrolled: Boolean,
+    visibilityFraction: Float,
+    modifier: Modifier = Modifier,
+    statusBarInsets: WindowInsets = WindowInsets.statusBarsIgnoringVisibility,
+    content: @Composable () -> Unit,
+) {
+    val scrimAlpha by
+        animateFloatAsState(
+            targetValue = if (scrolled) 1f else 0f,
+            animationSpec = tween(durationMillis = 260),
+            label = "home top bar scrim",
+        )
+    StatusBarAwareTopBarSlot(
+        visibilityFraction = visibilityFraction,
+        modifier = modifier.testTag("home_top_bar_slot"),
+        statusBarInsets = statusBarInsets,
+        statusBarColor = Color.Black.copy(alpha = scrimAlpha),
+        toolbarModifier = Modifier.background(Color.Black.copy(alpha = scrimAlpha)),
+        content = content,
     )
 }
 
@@ -1170,14 +1260,20 @@ internal fun StatusBarAwareTopBarSlot(
     visibilityFraction: Float,
     modifier: Modifier = Modifier,
     statusBarInsets: WindowInsets = WindowInsets.statusBarsIgnoringVisibility,
+    statusBarColor: Color? = null,
+    toolbarModifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
     Box(modifier = modifier) {
         Column(Modifier.fillMaxWidth()) {
-            Spacer(Modifier.fillMaxWidth().windowInsetsTopHeight(statusBarInsets))
+            Spacer(
+                Modifier.fillMaxWidth()
+                    .windowInsetsTopHeight(statusBarInsets)
+                    .background(statusBarColor ?: Color.Transparent)
+            )
             ChromeVisibilitySlot(
                 visibilityFraction = visibilityFraction,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().then(toolbarModifier),
                 content = content,
             )
         }
