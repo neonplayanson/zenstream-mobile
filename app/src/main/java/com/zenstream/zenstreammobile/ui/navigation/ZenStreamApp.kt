@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
@@ -33,6 +34,7 @@ import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.windowInsetsTopHeight
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -87,6 +89,9 @@ import com.zenstream.zenstreammobile.R
 import com.zenstream.zenstreammobile.audio.AudioCommandResult
 import com.zenstream.zenstreammobile.audio.AudioPlayerCoordinator
 import com.zenstream.zenstreammobile.data.AppUpdate
+import com.zenstream.zenstreammobile.data.AuthLifecycleLog
+import com.zenstream.zenstreammobile.data.AuthPhase
+import com.zenstream.zenstreammobile.data.AuthState
 import com.zenstream.zenstreammobile.data.CatalogRepository
 import com.zenstream.zenstreammobile.data.NativeAppDeepLink
 import com.zenstream.zenstreammobile.data.NativeAppDestination
@@ -172,11 +177,19 @@ fun ZenStreamApp(
                 onConfigured = appViewModel::configureServer,
             )
 
+        appState.showAuthRecovery ->
+            AuthRestoreUnavailableScreen(
+                onRetry = appViewModel::retryAuthentication,
+                onUseSignIn = appViewModel::useSignInInstead,
+            )
+
         appState.showLogin -> LoginScreen(repository, appViewModel::changeServer)
-        appState.session != null ->
+        appState.showMain ->
             MainScaffold(
                 repository = repository,
-                session = appState.session,
+                session = requireNotNull(appState.session),
+                authState = appState.authState,
+                onRetryAuthentication = appViewModel::retryAuthentication,
                 pendingDeepLink = appState.pendingDeepLink,
                 onNativeAppLinkConsumed = appViewModel::consumeNativeAppLink,
                 onLogout = appViewModel::logout,
@@ -186,6 +199,10 @@ fun ZenStreamApp(
                 onAvatarPickerResultConsumed = onAvatarPickerResultConsumed,
             )
         else -> LoadingScreen()
+    }
+
+    LaunchedEffect(appState.showLogin) {
+        if (appState.showLogin) AuthLifecycleLog.event("navigation_login", appState.session)
     }
 
     appState.availableUpdate?.let { update ->
@@ -258,11 +275,58 @@ private fun LoadingScreen() {
     }
 }
 
+@Composable
+private fun AuthRestoreUnavailableScreen(
+    onRetry: () -> Unit,
+    onUseSignIn: () -> Unit,
+) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                stringResource(R.string.auth_restore_unavailable),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.size(12.dp))
+            Button(onClick = onRetry) { Text(stringResource(R.string.retry)) }
+            TextButton(onClick = onUseSignIn) {
+                Text(stringResource(R.string.auth_use_sign_in))
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuthRetryBanner(onRetry: () -> Unit) {
+    androidx.compose.material3.Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier =
+                Modifier.fillMaxWidth()
+                    .padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                stringResource(R.string.auth_temporarily_unavailable),
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            TextButton(onClick = onRetry) { Text(stringResource(R.string.retry)) }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun MainScaffold(
     repository: CatalogRepository,
     session: AuthSession,
+    authState: AuthState,
+    onRetryAuthentication: () -> Unit,
     pendingDeepLink: NativeAppDeepLink?,
     onNativeAppLinkConsumed: () -> Unit,
     onLogout: () -> Unit,
@@ -272,16 +336,19 @@ private fun MainScaffold(
     onAvatarPickerResultConsumed: () -> Unit,
 ) {
     val context = LocalContext.current
-    val audio = remember(session.token) { AudioPlayerCoordinator(context, session) }
+    val audio =
+        remember(session.serverUrl, session.userId) { AudioPlayerCoordinator(context, session) }
     val audioState by audio.state.collectAsStateWithLifecycle()
     DisposableEffect(audio) {
         onDispose { audio.release() }
     }
-    val syncplay = remember(session.token) { repository.syncplayManager(session) }
+    val syncplay =
+        remember(session.serverUrl, session.userId) { repository.syncplayManager(session) }
+    LaunchedEffect(syncplay, session.token) { syncplay.updateSession(session) }
     val syncplayState by syncplay.state.collectAsStateWithLifecycle()
     val notificationsViewModel: NotificationsViewModel =
         viewModel(
-            key = "notifications-${session.userId}-${session.token}",
+            key = "notifications-${session.serverUrl}-${session.userId}",
             factory = NotificationsViewModel.Factory(repository, session),
         )
     val notificationsState by notificationsViewModel.uiState.collectAsStateWithLifecycle()
@@ -348,7 +415,7 @@ private fun MainScaffold(
         }
     }
     val navController = rememberNavController()
-    LaunchedEffect(pendingDeepLink, session.token) {
+    LaunchedEffect(pendingDeepLink, session.serverUrl, session.userId) {
         val link = pendingDeepLink ?: return@LaunchedEffect
         if (!sameNativeAppServer(session.serverUrl, link.serverUrl)) {
             return@LaunchedEffect
@@ -481,7 +548,7 @@ private fun MainScaffold(
         topBarVisibilityFraction = topBarVisibility.resetForRoute()
         if (mainRoute == NOTIFICATIONS) notificationsViewModel.refresh()
     }
-    LaunchedEffect(session.token) { notificationsViewModel.refresh() }
+    LaunchedEffect(session.serverUrl, session.userId) { notificationsViewModel.refresh() }
 
     val detailRoute =
         mainRoute in
@@ -499,52 +566,59 @@ private fun MainScaffold(
     Box(modifier = Modifier.fillMaxSize()) {
         androidx.compose.material3.Scaffold(
             topBar = {
-                if (!topBarHidden) {
-                    val topBarContent: @Composable () -> Unit = {
-                        MainTopBar(
-                            containerColor =
-                                if (mainRoute == HOME) Color.Transparent
-                                else MaterialTheme.colorScheme.background,
-                            windowInsets = WindowInsets(0, 0, 0, 0),
-                            syncplay = syncplay,
-                            session = session,
-                            showSearchAction = shouldShowMainSearchAction(mainRoute),
-                            onSearch = { navigateToSearch(navController) },
-                            unreadCount = notificationsState.unreadCount,
-                            onNotifications = {
-                                navController.navigate(NOTIFICATIONS) { launchSingleTop = true }
-                            },
-                            onReturnToView = { group ->
-                                group.mediaItemId()?.let { itemId ->
-                                    scope.launch {
-                                        if (
-                                            audio.pauseForVideoAndDetach() ==
-                                                AudioCommandResult.Applied
-                                        ) {
-                                            launchPlayback(context, itemId, "")
-                                        } else {
-                                            queueSnackbarHostState.showSnackbar(videoHandoffError)
+                Column {
+                    if (authState.phase == AuthPhase.TEMPORARILY_UNAVAILABLE) {
+                        AuthRetryBanner(onRetryAuthentication)
+                    }
+                    if (!topBarHidden) {
+                        val topBarContent: @Composable () -> Unit = {
+                            MainTopBar(
+                                containerColor =
+                                    if (mainRoute == HOME) Color.Transparent
+                                    else MaterialTheme.colorScheme.background,
+                                windowInsets = WindowInsets(0, 0, 0, 0),
+                                syncplay = syncplay,
+                                session = session,
+                                showSearchAction = shouldShowMainSearchAction(mainRoute),
+                                onSearch = { navigateToSearch(navController) },
+                                unreadCount = notificationsState.unreadCount,
+                                onNotifications = {
+                                    navController.navigate(NOTIFICATIONS) { launchSingleTop = true }
+                                },
+                                onReturnToView = { group ->
+                                    group.mediaItemId()?.let { itemId ->
+                                        scope.launch {
+                                            if (
+                                                audio.pauseForVideoAndDetach() ==
+                                                    AudioCommandResult.Applied
+                                            ) {
+                                                launchPlayback(context, itemId, "")
+                                            } else {
+                                                queueSnackbarHostState.showSnackbar(
+                                                    videoHandoffError
+                                                )
+                                            }
                                         }
                                     }
-                                }
-                            },
-                        )
-                    }
-                    if (mainRoute == HOME) {
-                        HomeTopBarSlot(
-                            scrolled = homeScrolled,
-                            visibilityFraction = topBarVisibilityFraction,
-                            modifier = Modifier.fillMaxWidth(),
-                            content = topBarContent,
-                        )
-                    } else {
-                        StatusBarAwareTopBarSlot(
-                            visibilityFraction = topBarVisibilityFraction,
-                            modifier =
-                                Modifier.fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.background),
-                            content = topBarContent,
-                        )
+                                },
+                            )
+                        }
+                        if (mainRoute == HOME) {
+                            HomeTopBarSlot(
+                                scrolled = homeScrolled,
+                                visibilityFraction = topBarVisibilityFraction,
+                                modifier = Modifier.fillMaxWidth(),
+                                content = topBarContent,
+                            )
+                        } else {
+                            StatusBarAwareTopBarSlot(
+                                visibilityFraction = topBarVisibilityFraction,
+                                modifier =
+                                    Modifier.fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.background),
+                                content = topBarContent,
+                            )
+                        }
                     }
                 }
             },

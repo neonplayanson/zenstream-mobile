@@ -13,12 +13,44 @@ import java.util.UUID
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class SessionStoreTest {
+    @Test
+    fun firstSessionReadWaitsForInitialDataStoreLoad() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val name = "${INSTRUMENTATION_SESSION_DATA_STORE_NAME}_cold_${UUID.randomUUID()}"
+        val store = SessionStore(context, dataStoreName = name)
+        val savedSession =
+            AuthSession(
+                "https://orchestrator.example",
+                "cold-access-token",
+                "user-1",
+                "User",
+            )
+        store.saveSession(savedSession)
+
+        val recreatedStore = SessionStore(context, dataStoreName = name)
+        assertEquals(savedSession, recreatedStore.session.first())
+
+        val loggedOutName =
+            "${INSTRUMENTATION_SESSION_DATA_STORE_NAME}_logged_out_${UUID.randomUUID()}"
+        val loggedOutStore = SessionStore(context, dataStoreName = loggedOutName)
+        assertEquals(
+            StoredSessionState.Loaded(null),
+            loggedOutStore.sessionState.first { it !is StoredSessionState.Loading },
+        )
+        assertNull(loggedOutStore.session.first())
+
+        store.clearAll()
+        loggedOutStore.clearAll()
+    }
+
     @Test
     fun persistsEncryptedSessionAndClearsIdentity() = runBlocking {
         val store =
@@ -49,6 +81,79 @@ class SessionStoreTest {
         assertEquals("https://orchestrator.example", store.orchestratorUrl.first())
         store.clearAll()
         assertNull(store.orchestratorUrl.first())
+    }
+
+    @Test
+    fun pendingRefreshAttemptSurvivesStoreRecreationAndRotationClearsItAtomically() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val name = "${INSTRUMENTATION_SESSION_DATA_STORE_NAME}_refresh_${UUID.randomUUID()}"
+        val store = SessionStore(context, dataStoreName = name)
+        val original =
+            AuthSession(
+                "https://orchestrator.example",
+                "access-before",
+                "user-1",
+                "User",
+                refreshToken = "refresh-before",
+                accessExpiresAtMillis = 1L,
+                refreshExpiresAtMillis = System.currentTimeMillis() + 60_000,
+            )
+        val attemptId = UUID.randomUUID().toString()
+        store.saveSession(original)
+
+        val pending = store.beginRefreshAttempt(original, attemptId)!!
+        assertEquals(attemptId, store.session.first()?.refreshAttemptId)
+
+        // A newly constructed store reads the same durable DataStore file, as a cold process does.
+        val recreatedStore = SessionStore(context, dataStoreName = name)
+        val restored = recreatedStore.session.first()!!
+        assertEquals(attemptId, restored.refreshAttemptId)
+        assertEquals("refresh-before", restored.refreshToken)
+
+        val rotated =
+            restored.copy(
+                token = "access-after",
+                refreshToken = "refresh-after",
+                accessExpiresAtMillis = System.currentTimeMillis() + 900_000,
+                refreshExpiresAtMillis = System.currentTimeMillis() + 86_400_000,
+                refreshAttemptId = null,
+            )
+        assertTrue(recreatedStore.saveRefreshedSessionIfCurrent(pending, rotated))
+
+        val saved = store.session.first()!!
+        assertEquals("access-after", saved.token)
+        assertEquals("refresh-after", saved.refreshToken)
+        assertNull(saved.refreshAttemptId)
+        assertFalse(store.clearSessionIfCurrent(pending, "stale_refresh_rejection"))
+        assertEquals("access-after", store.session.first()?.token)
+        store.clearAll()
+    }
+
+    @Test
+    fun staleClearCannotDeleteSessionWithNewPendingAttempt() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val store =
+            SessionStore(
+                context,
+                dataStoreName =
+                    "${INSTRUMENTATION_SESSION_DATA_STORE_NAME}_refresh_cas_${UUID.randomUUID()}",
+            )
+        val original =
+            AuthSession(
+                "https://orchestrator.example",
+                "access-before",
+                "user-1",
+                "User",
+                refreshToken = "refresh-before",
+            )
+        store.saveSession(original)
+        val pending = store.beginRefreshAttempt(original, UUID.randomUUID().toString())!!
+
+        assertFalse(store.clearSessionIfCurrent(original, "stale_401"))
+        assertEquals(pending.refreshAttemptId, store.session.first()?.refreshAttemptId)
+        assertTrue(store.clearSessionIfCurrent(pending, "refresh_rejected"))
+        assertNull(store.session.first())
+        store.clearAll()
     }
 
     @Test
@@ -147,6 +252,25 @@ class SessionStoreTest {
         assertEquals(PlaybackTimeDisplayMode.Elapsed, store.playbackTimeDisplayMode.first())
         store.clearAll()
         assertEquals(PlaybackTimeDisplayMode.Elapsed, store.playbackTimeDisplayMode.first())
+    }
+
+    @Test
+    fun automaticPictureInPictureDefaultsOnAndSurvivesSessionClears() = runBlocking {
+        val store =
+            SessionStore(
+                InstrumentationRegistry.getInstrumentation().targetContext,
+                dataStoreName =
+                    "${INSTRUMENTATION_SESSION_DATA_STORE_NAME}_auto_pip_${UUID.randomUUID()}",
+            )
+
+        assertTrue(store.automaticPictureInPicture.first())
+        store.saveAutomaticPictureInPicture(false)
+        assertFalse(store.automaticPictureInPicture.first())
+
+        store.clearSession()
+        assertFalse(store.automaticPictureInPicture.first())
+        store.clearAll()
+        assertFalse(store.automaticPictureInPicture.first())
     }
 
     @Test
