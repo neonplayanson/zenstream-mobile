@@ -1,6 +1,17 @@
 name: Android CI
 
 on:
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Exact candidate commit to validate
+        required: true
+        type: string
+      skip_coverage_upload:
+        description: Skip the external coverage report for release validation
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
   push:
     branches: [main]
@@ -9,7 +20,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: android-ci-${{ github.workflow }}-${{ github.ref }}
@@ -17,6 +27,127 @@ concurrency:
 
 jobs:
   build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_sha || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Verify candidate checkout
+        if: inputs.candidate_sha != ''
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Check out Orchestrator contract fixtures
+        uses: actions/checkout@v7
+        with:
+          repository: Loco-CTO/zenstream-orchestrator
+          ref: main
+          path: _contracts/zenstream-orchestrator
+          sparse-checkout: contracts/fixtures
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-37.0
+            build-tools;37.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run formatting, lint, unit tests, coverage, and debug build
+        env:
+          ZENSTREAM_API_FIXTURE_ROOT: ${{ github.workspace }}/_contracts/zenstream-orchestrator/contracts/fixtures
+        run: bash ./gradlew spotlessCheck lint :app:koverXmlReport assembleDebug
+
+      - name: Generate temporary release signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          store_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$store_password"
+          keytool -genkeypair -noprompt \
+            -keystore "$RUNNER_TEMP/zenstream-ci-release.jks" \
+            -storepass "$store_password" \
+            -keypass "$store_password" \
+            -alias zenstream-ci-release \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=ZenStream CI Release Smoke"
+          {
+            echo "ANDROID_RELEASE_STORE_FILE=$RUNNER_TEMP/zenstream-ci-release.jks"
+            echo "ANDROID_RELEASE_STORE_PASSWORD=$store_password"
+            echo "ANDROID_RELEASE_KEY_ALIAS=zenstream-ci-release"
+            echo "ANDROID_RELEASE_KEY_PASSWORD=$store_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release APK for emulator smoke
+        run: bash ./gradlew assembleRelease -PzenstreamMain=0 -PzenstreamRelease=true
+
+      - name: Upload release APK for emulator smoke
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Install DeepSource CLI
+        if: ${{ !inputs.skip_coverage_upload }}
+        run: curl -fsSL https://cli.deepsource.com/install | BINDIR=./bin sh
+
+      - name: Upload Kotlin coverage
+        if: ${{ !inputs.skip_coverage_upload }}
+        run: ./bin/deepsource report --analyzer test-coverage --key kotlin --value-file app/build/reports/kover/report.xml --use-oidc
+
+  release-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Download release APK
+        uses: actions/download-artifact@v8
+        with:
+          name: signed-release-apk
+          path: _artifacts
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install and launch release APK on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash ./scripts/smoke-release-apk.sh _artifacts/app-release.apk
+
+  instrumentation:
     runs-on: ubuntu-latest
 
     steps:
@@ -42,15 +173,42 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Apply formatting on main
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: bash ./gradlew spotlessApply
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-      - name: Run formatting, lint, unit tests, coverage, and debug build
-        run: bash ./gradlew spotlessCheck lint :app:koverXmlReport assembleDebug
+      - name: Select Android 37 compatible command-line tools
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ ! -d "$SDK/cmdline-tools/22.0" ]; then
+            echo "Android command-line tools 22.0 were not installed" >&2
+            exit 1
+          fi
+          rm -rf "$SDK/cmdline-tools/latest"
+          ln -s "$SDK/cmdline-tools/22.0" "$SDK/cmdline-tools/latest"
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --version
+          "$SDK/cmdline-tools/latest/bin/avdmanager" list device >/dev/null
 
-      - name: Install DeepSource CLI
-        run: curl -fsSL https://cli.deepsource.com/install | BINDIR=./bin sh
+      - name: Run connected instrumentation tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: '37.0'
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: ./gradlew :app:connectedDebugAndroidTest
 
-      - name: Upload Kotlin coverage
-        run: ./bin/deepsource report --analyzer test-coverage --key kotlin --value-file app/build/reports/kover/report.xml --use-oidc
+      - name: Upload instrumentation test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-instrumentation-reports
+          path: |
+            app/build/outputs/androidTest-results/connected/
+            app/build/reports/androidTests/connected/
+          if-no-files-found: warn
+          retention-days: 14

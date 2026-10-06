@@ -4,17 +4,33 @@ import com.zenstream.zenstreammobile.model.AuthSession
 import com.zenstream.zenstreammobile.model.SyncplayGroup
 import com.zenstream.zenstreammobile.model.SyncplayMember
 import com.zenstream.zenstreammobile.model.playableSyncplayItemId
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import java.io.IOException
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 
-class SyncplayApi(private val httpClient: OkHttpClient = OkHttpClient()) {
+fun interface SyncplayRequestAuthenticator {
+    suspend fun execute(
+        expected: AuthSession,
+        request: suspend (AuthSession) -> JSONObject,
+    ): JSONObject
+}
+
+class SyncplayApi(
+    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val requestAuthenticator: SyncplayRequestAuthenticator? = null,
+) {
     suspend fun groups(session: AuthSession, participantId: String): List<SyncplayGroup> =
         request(session, participantId, "groups").optJSONArray("groups").toGroups()
 
@@ -148,22 +164,19 @@ class SyncplayApi(private val httpClient: OkHttpClient = OkHttpClient()) {
             )
         )
 
-    suspend fun socketTicket(session: AuthSession): String =
-        withContext(Dispatchers.IO) {
-            val request =
-                Request.Builder()
-                    .url("${session.serverUrl}/api/auth/socket-ticket".toHttpUrl())
-                    .header("Authorization", "Bearer ${session.token}")
-                    .post("{}".toRequestBody(JSON))
-                    .build()
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful)
-                    throw SyncplayException(response.code, "Socket ticket request failed")
-                JSONObject(response.body?.string().orEmpty()).optString("ticket").ifBlank {
-                    error("Socket ticket was empty")
-                }
+    suspend fun socketTicket(session: AuthSession): String {
+        return authenticatedRequest(session) { current ->
+                val request =
+                    Request.Builder()
+                        .url("${current.serverUrl}/api/auth/socket-ticket".toHttpUrl())
+                        .header("Authorization", "Bearer ${current.token}")
+                        .post("{}".toRequestBody(JSON))
+                        .build()
+                execute(request)
             }
-        }
+            .optString("ticket")
+            .ifBlank { error("Socket ticket was empty") }
+    }
 
     private suspend fun request(
         session: AuthSession,
@@ -172,12 +185,12 @@ class SyncplayApi(private val httpClient: OkHttpClient = OkHttpClient()) {
         method: String = "GET",
         body: JSONObject? = null,
     ): JSONObject =
-        withContext(Dispatchers.IO) {
+        authenticatedRequest(session) { current ->
             val request =
                 Request.Builder()
-                    .url("${session.serverUrl}/api/syncplay/$path".toHttpUrl())
+                    .url("${current.serverUrl}/api/syncplay/$path".toHttpUrl())
                     .header("Accept", "application/json")
-                    .header("Authorization", "Bearer ${session.token}")
+                    .header("Authorization", "Bearer ${current.token}")
                     .header("X-ZenStream-Participant", participantId)
                     .method(
                         method,
@@ -185,18 +198,46 @@ class SyncplayApi(private val httpClient: OkHttpClient = OkHttpClient()) {
                         else (body?.toString() ?: "{}").toRequestBody(JSON),
                     )
                     .build()
-            httpClient.newCall(request).execute().use { response ->
-                val content = response.body?.string().orEmpty()
-                if (!response.isSuccessful)
-                    throw SyncplayException(
-                        response.code,
-                        JSONObject(content.ifBlank { "{}" }).optString("detail").ifBlank {
-                            "Syncplay request failed"
-                        },
-                        content,
-                    )
-                JSONObject(content.ifBlank { "{}" })
-            }
+            execute(request)
+        }
+
+    private suspend fun authenticatedRequest(
+        session: AuthSession,
+        request: suspend (AuthSession) -> JSONObject,
+    ): JSONObject = requestAuthenticator?.execute(session, request) ?: request(session)
+
+    private suspend fun execute(request: Request): JSONObject =
+        suspendCancellableCoroutine { continuation ->
+            val call = httpClient.newCall(request)
+            call.timeout().timeout(8, TimeUnit.SECONDS)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(
+                object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        if (continuation.isActive) continuation.resumeWithException(e)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        try {
+                            val result = response.use {
+                                val content = it.body.string()
+                                if (!it.isSuccessful)
+                                    throw SyncplayException(
+                                        it.code,
+                                        runCatching { JSONObject(content).optString("detail") }
+                                            .getOrDefault("")
+                                            .ifBlank { "Syncplay request failed" },
+                                        content,
+                                    )
+                                JSONObject(content.ifBlank { "{}" })
+                            }
+                            if (continuation.isActive) continuation.resume(result)
+                        } catch (error: Exception) {
+                            if (continuation.isActive) continuation.resumeWithException(error)
+                        }
+                    }
+                }
+            )
         }
 
     private fun operation(
